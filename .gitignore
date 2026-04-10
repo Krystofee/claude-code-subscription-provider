@@ -1,0 +1,11 @@
+node_modules/
+logs/
+unredacted-logs/
+.claude-interceptor-ca/
+.claude-interceptor-ca-test/
+.claude-interceptor.env
+.ca-unred/
+.curl-ca*/
+.node-fetch-ca/
+.claude-mitm-*/
+.port-ca/

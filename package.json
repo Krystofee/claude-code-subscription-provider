@@ -1,0 +1,29 @@
+{
+  "name": "pi-claude-code-subscription",
+  "version": "1.0.0",
+  "description": "Subscription-compatible network interceptor for Claude Code",
+  "main": "src/claude-network-interceptor.js",
+  "scripts": {
+    "interceptor": "node src/claude-network-interceptor.js",
+    "demo:hello": "node src/claude-network-interceptor.js --exec claude -- --print \"Hello world\""
+  },
+  "keywords": [
+    "claude",
+    "proxy",
+    "interceptor",
+    "subscription",
+    "mitm"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.66.1",
+    "@mariozechner/pi-coding-agent": "^0.66.1",
+    "http-mitm-proxy": "^1.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
