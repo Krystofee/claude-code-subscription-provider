@@ -1,0 +1,8 @@
+{
+  "name": "claude-code-subscription-provider-extension",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "http-mitm-proxy": "^1.1.0"
+  }
+}

@@ -42,14 +42,14 @@ type ClaudeCodeTokenBundle = {
 	xApp?: string;
 };
 
-const CLAUDE_CODE_PROVIDER = "claude-code";
+const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 const CLAUDE_CODE_MODEL_ID = "opus-4-6";
 const ANTHROPIC_MODEL_ID = "claude-opus-4-6";
 const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
-const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-provider.json");
+const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-subscription-provider.json");
 const DEFAULT_USER_AGENT = "claude-cli/2.1.100 (external, sdk-cli)";
 const DEFAULT_X_APP = "cli";
 const DEFAULT_MAX_TOKENS = 64_000;
@@ -305,7 +305,7 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 	await ensureClaudeSubscriptionAuth(false);
 
 	const port = await getFreePort();
-	const caDir = await fsp.mkdtemp(path.join(os.tmpdir(), "pi-claude-code-provider-ca-"));
+	const caDir = await fsp.mkdtemp(path.join(os.tmpdir(), "pi-claude-code-subscription-provider-ca-"));
 	const proxy = new Proxy();
 	const proxyHost = "127.0.0.1";
 	const proxyUrl = `http://${proxyHost}:${port}`;
@@ -589,7 +589,7 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		models: [
 			{
 				id: CLAUDE_CODE_MODEL_ID,
-				name: "Claude Code / Opus 4.6 (1M)",
+				name: "Claude Code Subscription Provider / Opus 4.6 (1M)",
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
