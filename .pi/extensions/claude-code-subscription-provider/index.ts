@@ -43,8 +43,8 @@ type ClaudeCodeTokenBundle = {
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
-const CLAUDE_CODE_MODEL_ID = "opus-4-6";
-const ANTHROPIC_MODEL_ID = "claude-opus-4-6";
+const CLAUDE_CODE_MODEL_ID = "opus-4-7";
+const ANTHROPIC_MODEL_ID = "claude-opus-4-7";
 const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
@@ -135,7 +135,37 @@ function injectSystemRemindersIntoMessages(
 	return normalizedMessages;
 }
 
-function rewriteClaudeCodePayload(payload: unknown): unknown {
+function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReasoning?: string) {
+	const model = typeof payload.model === "string" ? payload.model : "";
+	const isOpus47 = model.includes("opus-4-7") || model.includes("opus-4.7");
+	if (!isOpus47) return;
+
+	// Opus 4.7 defaults thinking.display to "omitted", which makes thinking_delta
+	// events empty (only signature_delta is sent). Explicitly opt in to summarized
+	// thinking so users see reasoning in the UI, matching Opus 4.6 behavior.
+	// https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-4-7
+	const thinking = payload.thinking;
+	if (thinking && typeof thinking === "object" && (thinking as Record<string, unknown>).type === "adaptive") {
+		const thinkingObj = { ...(thinking as Record<string, unknown>) };
+		if (thinkingObj.display == null) {
+			thinkingObj.display = "summarized";
+		}
+		payload.thinking = thinkingObj;
+	}
+
+	if (selectedReasoning !== "high" && selectedReasoning !== "xhigh" && selectedReasoning !== "max") return;
+	if (!thinking || typeof thinking !== "object") return;
+	if ((thinking as Record<string, unknown>).type !== "adaptive") return;
+
+	const outputConfig =
+		payload.output_config && typeof payload.output_config === "object"
+			? { ...(payload.output_config as Record<string, unknown>) }
+			: {};
+	outputConfig.effort = selectedReasoning;
+	payload.output_config = outputConfig;
+}
+
+function rewriteClaudeCodePayload(payload: unknown, selectedReasoning?: string): unknown {
 	if (!payload || typeof payload !== "object") return payload;
 	const next = structuredClone(payload as Record<string, unknown>);
 	const reminderBlocks = extractSystemReminderBlocks(next.system);
@@ -150,6 +180,7 @@ function rewriteClaudeCodePayload(payload: unknown): unknown {
 	if (next.context_management == null) {
 		next.context_management = CLAUDE_CODE_CONTEXT_MANAGEMENT;
 	}
+	normalizeOpus47Thinking(next, selectedReasoning);
 	return next;
 }
 
@@ -508,7 +539,7 @@ async function pipeAttempt(
 		},
 		onPayload: async (payload, payloadModel) => {
 			const callerPayload = await options?.onPayload?.(payload, payloadModel);
-			return rewriteClaudeCodePayload(callerPayload ?? payload);
+			return rewriteClaudeCodePayload(callerPayload ?? payload, options?.reasoning as string | undefined);
 		},
 	});
 
@@ -589,7 +620,7 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		models: [
 			{
 				id: CLAUDE_CODE_MODEL_ID,
-				name: "Claude Code Subscription Provider / Opus 4.6 (1M)",
+				name: "Claude Code Subscription Provider / Opus 4.7 (1M)",
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },

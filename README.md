@@ -73,7 +73,7 @@ Např. pro `claude -p "Hello world"` jsem ověřil requesty na:
 - Pokud chceš vidět i secrety, spusť s `--no-redact`.
 - Těla se ukládají maximálně do velikosti `--body-limit-bytes` na request/response.
 
-## Pi provider: `claude-code-subscription-provider/opus-4-6`
+## Pi provider: `claude-code-subscription-provider/opus-4-7`
 
 Repo je zároveň installable jako pi package a obsahuje project-local pi extension:
 
@@ -81,8 +81,10 @@ Repo je zároveň installable jako pi package a obsahuje project-local pi extens
 
 Co dělá:
 
-- registruje model `claude-code-subscription-provider/opus-4-6`
+- registruje model `claude-code-subscription-provider/opus-4-7`
 - pro requesty používá Anthropic Messages API
+- pro `claude-opus-4-7` zachovává native adaptive effort levels (`high`, `xhigh`, `max`) a nepřemapovává `xhigh` na `max`
+- pro `claude-opus-4-7` automaticky nastaví `thinking.display = "summarized"` (Opus 4.7 defaultně skrývá thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí)
 - access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture
 - token ukládá do `~/.pi/agent/cache/claude-code-subscription-provider.json`
 - při neplatném cached tokenu udělá refresh a request zopakuje
@@ -103,7 +105,7 @@ pi
 Pak v pi:
 
 ```text
-/model claude-code-subscription-provider/opus-4-6
+/model claude-code-subscription-provider/opus-4-7
 ```
 
 Volitelně lze zkontrolovat nebo refreshnout cache:
