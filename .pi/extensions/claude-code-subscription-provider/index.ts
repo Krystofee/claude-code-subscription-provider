@@ -45,6 +45,26 @@ type ClaudeCodeTokenBundle = {
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 const CLAUDE_CODE_MODEL_ID = "opus-4-7";
 const ANTHROPIC_MODEL_ID = "claude-opus-4-7";
+
+// pi's ThinkingLevel tops out at "xhigh" but Anthropic's adaptive thinking on
+// Opus 4.6/4.7 accepts effort up to "max". Shift every level one step up so the
+// pi UI can drive the full effort range — "xhigh" picks Anthropic's "max",
+// "high" picks "xhigh", etc. "off" stays adaptive (no override).
+function mapReasoningToEffort(level: string | undefined): string | undefined {
+	switch (level) {
+		case "low":
+		case "minimal":
+			return "low";
+		case "medium":
+			return "high";
+		case "high":
+			return "xhigh";
+		case "xhigh":
+			return "max";
+		default:
+			return undefined;
+	}
+}
 const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
@@ -135,7 +155,7 @@ function injectSystemRemindersIntoMessages(
 	return normalizedMessages;
 }
 
-function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReasoning?: string) {
+function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReasoning: string | undefined) {
 	const model = typeof payload.model === "string" ? payload.model : "";
 	const isOpus47 = model.includes("opus-4-7") || model.includes("opus-4.7");
 	if (!isOpus47) return;
@@ -153,7 +173,8 @@ function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReaso
 		payload.thinking = thinkingObj;
 	}
 
-	if (selectedReasoning !== "high" && selectedReasoning !== "xhigh" && selectedReasoning !== "max") return;
+	const effort = mapReasoningToEffort(selectedReasoning);
+	if (!effort) return;
 	if (!thinking || typeof thinking !== "object") return;
 	if ((thinking as Record<string, unknown>).type !== "adaptive") return;
 
@@ -161,11 +182,11 @@ function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReaso
 		payload.output_config && typeof payload.output_config === "object"
 			? { ...(payload.output_config as Record<string, unknown>) }
 			: {};
-	outputConfig.effort = selectedReasoning;
+	outputConfig.effort = effort;
 	payload.output_config = outputConfig;
 }
 
-function rewriteClaudeCodePayload(payload: unknown, selectedReasoning?: string): unknown {
+function rewriteClaudeCodePayload(payload: unknown, selectedReasoning: string | undefined): unknown {
 	if (!payload || typeof payload !== "object") return payload;
 	const next = structuredClone(payload as Record<string, unknown>);
 	const reminderBlocks = extractSystemReminderBlocks(next.system);
