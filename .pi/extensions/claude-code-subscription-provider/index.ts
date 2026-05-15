@@ -47,24 +47,17 @@ const CLAUDE_CODE_MODEL_ID = "opus-4-7";
 const ANTHROPIC_MODEL_ID = "claude-opus-4-7";
 
 // pi's ThinkingLevel tops out at "xhigh" but Anthropic's adaptive thinking on
-// Opus 4.6/4.7 accepts effort up to "max". Shift every level one step up so the
-// pi UI can drive the full effort range — "xhigh" picks Anthropic's "max",
-// "high" picks "xhigh", etc. "off" stays adaptive (no override).
-function mapReasoningToEffort(level: string | undefined): string | undefined {
-	switch (level) {
-		case "low":
-		case "minimal":
-			return "low";
-		case "medium":
-			return "high";
-		case "high":
-			return "xhigh";
-		case "xhigh":
-			return "max";
-		default:
-			return undefined;
-	}
-}
+// Opus 4.7 also accepts "max". Shift every level one step up so the pi UI can
+// drive the full effort range — "xhigh" picks Anthropic's "max", "high" picks
+// "xhigh", etc. pi-ai picks these up from the model's `thinkingLevelMap`,
+// which also drives whether "xhigh" appears in the UI picker.
+const CLAUDE_CODE_THINKING_LEVEL_MAP = {
+	minimal: "low",
+	low: "low",
+	medium: "high",
+	high: "xhigh",
+	xhigh: "max",
+} as const;
 const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
@@ -155,7 +148,7 @@ function injectSystemRemindersIntoMessages(
 	return normalizedMessages;
 }
 
-function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReasoning: string | undefined) {
+function normalizeOpus47Thinking(payload: Record<string, unknown>) {
 	const model = typeof payload.model === "string" ? payload.model : "";
 	const isOpus47 = model.includes("opus-4-7") || model.includes("opus-4.7");
 	if (!isOpus47) return;
@@ -172,21 +165,9 @@ function normalizeOpus47Thinking(payload: Record<string, unknown>, selectedReaso
 		}
 		payload.thinking = thinkingObj;
 	}
-
-	const effort = mapReasoningToEffort(selectedReasoning);
-	if (!effort) return;
-	if (!thinking || typeof thinking !== "object") return;
-	if ((thinking as Record<string, unknown>).type !== "adaptive") return;
-
-	const outputConfig =
-		payload.output_config && typeof payload.output_config === "object"
-			? { ...(payload.output_config as Record<string, unknown>) }
-			: {};
-	outputConfig.effort = effort;
-	payload.output_config = outputConfig;
 }
 
-function rewriteClaudeCodePayload(payload: unknown, selectedReasoning: string | undefined): unknown {
+function rewriteClaudeCodePayload(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object") return payload;
 	const next = structuredClone(payload as Record<string, unknown>);
 	const reminderBlocks = extractSystemReminderBlocks(next.system);
@@ -201,7 +182,7 @@ function rewriteClaudeCodePayload(payload: unknown, selectedReasoning: string | 
 	if (next.context_management == null) {
 		next.context_management = CLAUDE_CODE_CONTEXT_MANAGEMENT;
 	}
-	normalizeOpus47Thinking(next, selectedReasoning);
+	normalizeOpus47Thinking(next);
 	return next;
 }
 
@@ -560,7 +541,7 @@ async function pipeAttempt(
 		},
 		onPayload: async (payload, payloadModel) => {
 			const callerPayload = await options?.onPayload?.(payload, payloadModel);
-			return rewriteClaudeCodePayload(callerPayload ?? payload, options?.reasoning as string | undefined);
+			return rewriteClaudeCodePayload(callerPayload ?? payload);
 		},
 	});
 
@@ -638,6 +619,10 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		baseUrl: "https://api.anthropic.com",
 		apiKey: "claude-code-bootstrap",
 		api: "claude-code-anthropic",
+		// thinkingLevelMap is a newer field (pi-ai ≥0.67) — cast to any so the
+		// build doesn't fail on the older types bundled in this repo. The pi
+		// runtime reads it to decide which thinking levels show up in the UI and
+		// what effort string to send to Anthropic.
 		models: [
 			{
 				id: CLAUDE_CODE_MODEL_ID,
@@ -647,7 +632,9 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 				contextWindow: 1_000_000,
 				maxTokens: 128_000,
-			},
+				thinkingLevelMap: CLAUDE_CODE_THINKING_LEVEL_MAP,
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			} as any,
 		],
 		streamSimple: streamClaudeCodeProvider,
 	});
