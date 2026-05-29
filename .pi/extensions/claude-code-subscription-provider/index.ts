@@ -17,8 +17,8 @@ import {
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const require = createRequire(import.meta.url);
 const { Proxy } = require("http-mitm-proxy");
@@ -43,11 +43,11 @@ type ClaudeCodeTokenBundle = {
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
-const CLAUDE_CODE_MODEL_ID = "opus-4-7";
-const ANTHROPIC_MODEL_ID = "claude-opus-4-7";
+const CLAUDE_CODE_MODEL_ID = "opus-4-8";
+const ANTHROPIC_MODEL_ID = "claude-opus-4-8";
 
 // pi's ThinkingLevel tops out at "xhigh" but Anthropic's adaptive thinking on
-// Opus 4.7 also accepts "max". Shift every level one step up so the pi UI can
+// Opus 4.8 also accepts "max". Shift every level one step up so the pi UI can
 // drive the full effort range — "xhigh" picks Anthropic's "max", "high" picks
 // "xhigh", etc. pi-ai picks these up from the model's `thinkingLevelMap`,
 // which also drives whether "xhigh" appears in the UI picker.
@@ -148,12 +148,16 @@ function injectSystemRemindersIntoMessages(
 	return normalizedMessages;
 }
 
-function normalizeOpus47Thinking(payload: Record<string, unknown>) {
+function normalizeOpus4xThinking(payload: Record<string, unknown>) {
 	const model = typeof payload.model === "string" ? payload.model : "";
-	const isOpus47 = model.includes("opus-4-7") || model.includes("opus-4.7");
-	if (!isOpus47) return;
+	const isOpus4xHidden =
+		model.includes("opus-4-7") ||
+		model.includes("opus-4.7") ||
+		model.includes("opus-4-8") ||
+		model.includes("opus-4.8");
+	if (!isOpus4xHidden) return;
 
-	// Opus 4.7 defaults thinking.display to "omitted", which makes thinking_delta
+	// Opus 4.7+ defaults thinking.display to "omitted", which makes thinking_delta
 	// events empty (only signature_delta is sent). Explicitly opt in to summarized
 	// thinking so users see reasoning in the UI, matching Opus 4.6 behavior.
 	// https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-4-7
@@ -182,7 +186,7 @@ function rewriteClaudeCodePayload(payload: unknown): unknown {
 	if (next.context_management == null) {
 		next.context_management = CLAUDE_CODE_CONTEXT_MANAGEMENT;
 	}
-	normalizeOpus47Thinking(next);
+	normalizeOpus4xThinking(next);
 	return next;
 }
 
@@ -520,6 +524,14 @@ function toAnthropicModel(model: Model<Api>): Model<"anthropic-messages"> {
 		...model,
 		api: "anthropic-messages",
 		id: model.id === CLAUDE_CODE_MODEL_ID ? ANTHROPIC_MODEL_ID : model.id,
+		// pi-ai 0.77 reads compat.forceAdaptiveThinking from the model to decide
+		// whether to send `thinking.type: "adaptive"` + `output_config.effort`.
+		// Opus 4.7+ require the adaptive format; force it regardless of the
+		// remapped id so future Opus 4.x versions keep working.
+		compat: {
+			...((model as Model<"anthropic-messages">).compat ?? {}),
+			forceAdaptiveThinking: true,
+		},
 	} as Model<"anthropic-messages">;
 }
 
@@ -619,22 +631,17 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		baseUrl: "https://api.anthropic.com",
 		apiKey: "claude-code-bootstrap",
 		api: "claude-code-anthropic",
-		// thinkingLevelMap is a newer field (pi-ai ≥0.67) — cast to any so the
-		// build doesn't fail on the older types bundled in this repo. The pi
-		// runtime reads it to decide which thinking levels show up in the UI and
-		// what effort string to send to Anthropic.
 		models: [
 			{
 				id: CLAUDE_CODE_MODEL_ID,
-				name: "Claude Code Subscription Provider / Opus 4.7 (1M)",
+				name: "Claude Code Subscription Provider / Opus 4.8 (1M)",
 				reasoning: true,
 				input: ["text", "image"],
 				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 				contextWindow: 1_000_000,
 				maxTokens: 128_000,
 				thinkingLevelMap: CLAUDE_CODE_THINKING_LEVEL_MAP,
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} as any,
+			},
 		],
 		streamSimple: streamClaudeCodeProvider,
 	});
