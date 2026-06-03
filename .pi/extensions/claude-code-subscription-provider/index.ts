@@ -18,7 +18,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 const require = createRequire(import.meta.url);
 const { Proxy } = require("http-mitm-proxy");
@@ -43,21 +43,77 @@ type ClaudeCodeTokenBundle = {
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
-const CLAUDE_CODE_MODEL_ID = "opus-4-8";
-const ANTHROPIC_MODEL_ID = "claude-opus-4-8";
 
-// pi's ThinkingLevel tops out at "xhigh" but Anthropic's adaptive thinking on
-// Opus 4.8 also accepts "max". Shift every level one step up so the pi UI can
-// drive the full effort range — "xhigh" picks Anthropic's "max", "high" picks
-// "xhigh", etc. pi-ai picks these up from the model's `thinkingLevelMap`,
-// which also drives whether "xhigh" appears in the UI picker.
-const CLAUDE_CODE_THINKING_LEVEL_MAP = {
-	minimal: "low",
-	low: "low",
-	medium: "high",
-	high: "xhigh",
-	xhigh: "max",
-} as const;
+// The set of models this provider exposes. Each entry maps a pi-facing id (what
+// shows up in `/model`) to the real Anthropic model id we send upstream. The
+// cost / contextWindow / maxTokens / thinkingLevelMap values mirror pi-ai 0.77's
+// native `anthropic` catalog so the subscription path behaves like first-party.
+//
+// thinkingLevelMap: pi's ThinkingLevel tops out at "xhigh". Opus 4.6's adaptive
+// thinking calls its top effort "max" (xhigh -> "max"); Opus 4.7/4.8 renamed that
+// cap to "xhigh" (xhigh -> "xhigh"); Sonnet 4.6 uses pi's default mapping. All
+// four use the adaptive thinking format (forced via compat.forceAdaptiveThinking
+// in toAnthropicModel).
+type ClaudeCodeModelDef = {
+	id: string;
+	anthropicId: string;
+	name: string;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	contextWindow: number;
+	maxTokens: number;
+	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+};
+
+const OPUS_COST = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
+const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
+
+const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
+	{
+		id: "opus-4-8",
+		anthropicId: "claude-opus-4-8",
+		name: "Claude Code Subscription Provider / Opus 4.8 (1M)",
+		cost: OPUS_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
+	{
+		id: "opus-4-7",
+		anthropicId: "claude-opus-4-7",
+		name: "Claude Code Subscription Provider / Opus 4.7 (1M)",
+		cost: OPUS_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
+	{
+		id: "opus-4-6",
+		anthropicId: "claude-opus-4-6",
+		name: "Claude Code Subscription Provider / Opus 4.6 (1M)",
+		cost: OPUS_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "max" },
+	},
+	{
+		id: "sonnet-4-6",
+		anthropicId: "claude-sonnet-4-6",
+		name: "Claude Code Subscription Provider / Sonnet 4.6 (1M)",
+		cost: SONNET_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+	},
+];
+
+const ANTHROPIC_ID_BY_MODEL_ID = new Map(
+	CLAUDE_CODE_MODELS.map((model): [string, string] => [model.id, model.anthropicId]),
+);
+
+// Model used for the auth-capture probe and status text. The probe only needs a
+// valid model so `claude` emits a request we can sniff the bearer token from —
+// any subscription model works, so we pin it to the default.
+const DEFAULT_MODEL_ID = "opus-4-8";
+const CAPTURE_ANTHROPIC_MODEL = ANTHROPIC_ID_BY_MODEL_ID.get(DEFAULT_MODEL_ID) ?? "claude-opus-4-8";
 const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
@@ -393,7 +449,7 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 
 	const child = spawn(
 		"claude",
-		["--model", ANTHROPIC_MODEL_ID, "--print", CAPTURE_PROMPT],
+		["--model", CAPTURE_ANTHROPIC_MODEL, "--print", CAPTURE_PROMPT],
 		{
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
@@ -523,11 +579,11 @@ function toAnthropicModel(model: Model<Api>): Model<"anthropic-messages"> {
 	return {
 		...model,
 		api: "anthropic-messages",
-		id: model.id === CLAUDE_CODE_MODEL_ID ? ANTHROPIC_MODEL_ID : model.id,
+		id: ANTHROPIC_ID_BY_MODEL_ID.get(model.id) ?? model.id,
 		// pi-ai 0.77 reads compat.forceAdaptiveThinking from the model to decide
 		// whether to send `thinking.type: "adaptive"` + `output_config.effort`.
-		// Opus 4.7+ require the adaptive format; force it regardless of the
-		// remapped id so future Opus 4.x versions keep working.
+		// Every model this provider exposes (Opus 4.6/4.7/4.8, Sonnet 4.6) uses the
+		// adaptive thinking format, so force it regardless of the remapped id.
 		compat: {
 			...((model as Model<"anthropic-messages">).compat ?? {}),
 			forceAdaptiveThinking: true,
@@ -631,18 +687,16 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		baseUrl: "https://api.anthropic.com",
 		apiKey: "claude-code-bootstrap",
 		api: "claude-code-anthropic",
-		models: [
-			{
-				id: CLAUDE_CODE_MODEL_ID,
-				name: "Claude Code Subscription Provider / Opus 4.8 (1M)",
-				reasoning: true,
-				input: ["text", "image"],
-				cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-				contextWindow: 1_000_000,
-				maxTokens: 128_000,
-				thinkingLevelMap: CLAUDE_CODE_THINKING_LEVEL_MAP,
-			},
-		],
+		models: CLAUDE_CODE_MODELS.map((model): ProviderModelConfig => ({
+			id: model.id,
+			name: model.name,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: model.cost,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			thinkingLevelMap: model.thinkingLevelMap,
+		})),
 		streamSimple: streamClaudeCodeProvider,
 	});
 
@@ -663,7 +717,7 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 			try {
 				const bundle = await getTokenBundle(true);
 				ctx.ui.notify(
-					`Refreshed Claude Code token (${formatCacheAge(bundle)}). Provider model: ${CLAUDE_CODE_PROVIDER}/${CLAUDE_CODE_MODEL_ID}`,
+					`Refreshed Claude Code token (${formatCacheAge(bundle)}). Models: ${CLAUDE_CODE_MODELS.map((m) => m.id).join(", ")}`,
 					"info",
 				);
 			} catch (error) {
@@ -675,9 +729,9 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 
 export {
 	CAPTURE_PROMPT,
-	CLAUDE_CODE_MODEL_ID,
+	CLAUDE_CODE_MODELS,
 	CLAUDE_CODE_PROVIDER,
-	ANTHROPIC_MODEL_ID,
+	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
 	getTokenBundle,
 	streamClaudeCodeProvider,

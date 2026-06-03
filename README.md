@@ -73,7 +73,7 @@ Např. pro `claude -p "Hello world"` jsem ověřil requesty na:
 - Pokud chceš vidět i secrety, spusť s `--no-redact`.
 - Těla se ukládají maximálně do velikosti `--body-limit-bytes` na request/response.
 
-## Pi provider: `claude-code-subscription-provider/opus-4-8`
+## Pi provider: `claude-code-subscription-provider`
 
 Repo je zároveň installable jako pi package a obsahuje project-local pi extension:
 
@@ -81,11 +81,15 @@ Repo je zároveň installable jako pi package a obsahuje project-local pi extens
 
 Co dělá:
 
-- registruje model `claude-code-subscription-provider/opus-4-8`
-- pro requesty používá Anthropic Messages API
-- pro `claude-opus-4-8` zachovává native adaptive effort levels (`high`, `xhigh`, `max`) a nepřemapovává `xhigh` na `max`
-- pro `claude-opus-4-8` automaticky nastaví `thinking.display = "summarized"` (Opus 4.8 defaultně skrývá thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí)
-- access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture
+- registruje sadu modelů (pi id → Anthropic id):
+  - `claude-code-subscription-provider/opus-4-8` → `claude-opus-4-8`
+  - `claude-code-subscription-provider/opus-4-7` → `claude-opus-4-7`
+  - `claude-code-subscription-provider/opus-4-6` → `claude-opus-4-6`
+  - `claude-code-subscription-provider/sonnet-4-6` → `claude-sonnet-4-6`
+- pro requesty používá Anthropic Messages API a u všech modelů vynutí adaptive thinking (`compat.forceAdaptiveThinking`)
+- `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, Opus 4.7/4.8 `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
+- pro Opus 4.7/4.8 automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
+- access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture (probe běží na `claude-opus-4-8`)
 - token ukládá do `~/.pi/agent/cache/claude-code-subscription-provider.json`
 - při neplatném cached tokenu udělá refresh a request zopakuje
 - když Claude Code není přihlášené, vypíše instrukci k `claude auth login --claudeai`
@@ -102,10 +106,13 @@ Použití v pi:
 pi
 ```
 
-Pak v pi:
+Pak v pi (vyber libovolný model ze sady):
 
 ```text
 /model claude-code-subscription-provider/opus-4-8
+/model claude-code-subscription-provider/opus-4-7
+/model claude-code-subscription-provider/opus-4-6
+/model claude-code-subscription-provider/sonnet-4-6
 ```
 
 Volitelně lze zkontrolovat nebo refreshnout cache:
