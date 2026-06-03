@@ -98,9 +98,10 @@ const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 	{
 		id: "sonnet-4-6",
 		anthropicId: "claude-sonnet-4-6",
-		name: "Claude Code Subscription Provider / Sonnet 4.6 (1M)",
+		name: "Claude Code Subscription Provider / Sonnet 4.6 (256k)",
 		cost: SONNET_COST,
-		contextWindow: 1_000_000,
+		// Subscription tier caps Sonnet at 256k context (1M requires usage credits).
+		contextWindow: 256_000,
 		maxTokens: 64_000,
 	},
 ];
