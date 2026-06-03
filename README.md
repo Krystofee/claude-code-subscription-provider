@@ -86,6 +86,7 @@ Co dělá:
   - `claude-code-subscription-provider/opus-4-7` → `claude-opus-4-7`
   - `claude-code-subscription-provider/opus-4-6` → `claude-opus-4-6`
   - `claude-code-subscription-provider/sonnet-4-6` → `claude-sonnet-4-6` (256k — subscription tier nemá 1M na Sonnetu)
+- 1M long-context beta (`context-1m-2025-08-07`) posílá jen u modelů s 1M oknem (Opus). U Sonnetu se vynechává — jinak Anthropic vrací 429 `Usage credits are required for long context requests` i na malém promptu.
 - pro requesty používá Anthropic Messages API a u všech modelů vynutí adaptive thinking (`compat.forceAdaptiveThinking`)
 - `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, Opus 4.7/4.8 `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
 - pro Opus 4.7/4.8 automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně

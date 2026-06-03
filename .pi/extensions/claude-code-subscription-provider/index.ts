@@ -134,6 +134,14 @@ const REQUIRED_BETAS = [
 	"advanced-tool-use-2025-11-20",
 	"effort-2025-11-24",
 ];
+// Opting into the 1M beta routes the request to the long-context tier. That tier
+// is included for Opus on a Max subscription but NOT for Sonnet — sending this
+// beta on Sonnet gets a 429 "Usage credits are required for long context
+// requests" even on tiny prompts. So only send it for models that advertise 1M.
+const CONTEXT_1M_BETA = "context-1m-2025-08-07";
+const MODEL_IDS_WITH_1M = new Set(
+	CLAUDE_CODE_MODELS.filter((model) => model.contextWindow >= 1_000_000).map((model) => model.id),
+);
 const CLAUDE_CODE_SDK_SYSTEM_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const CLAUDE_CODE_CONTEXT_MANAGEMENT = {
 	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
@@ -151,6 +159,13 @@ function splitBetas(value?: string): string[] {
 
 function normalizeAnthropicBeta(_value?: string): string {
 	return REQUIRED_BETAS.join(",");
+}
+
+function betaHeaderForModel(modelId: string): string {
+	const betas = MODEL_IDS_WITH_1M.has(modelId)
+		? REQUIRED_BETAS
+		: REQUIRED_BETAS.filter((beta) => beta !== CONTEXT_1M_BETA);
+	return betas.join(",");
 }
 
 function buildBillingHeader(): string {
@@ -566,9 +581,9 @@ async function getTokenBundle(forceRefresh = false): Promise<ClaudeCodeTokenBund
 	}
 }
 
-function providerHeaders(bundle: ClaudeCodeTokenBundle): Record<string, string> {
+function providerHeaders(bundle: ClaudeCodeTokenBundle, modelId: string): Record<string, string> {
 	return {
-		"anthropic-beta": normalizeAnthropicBeta(bundle.anthropicBeta),
+		"anthropic-beta": betaHeaderForModel(modelId),
 		"user-agent": bundle.userAgent || DEFAULT_USER_AGENT,
 		"x-app": bundle.xApp || DEFAULT_X_APP,
 		"x-claude-code-session-id": randomUUID(),
@@ -605,7 +620,7 @@ async function pipeAttempt(
 		maxTokens: options?.maxTokens ?? DEFAULT_MAX_TOKENS,
 		apiKey: bundle.accessToken,
 		headers: {
-			...providerHeaders(bundle),
+			...providerHeaders(bundle, model.id),
 			...(options?.headers || {}),
 		},
 		onPayload: async (payload, payloadModel) => {
