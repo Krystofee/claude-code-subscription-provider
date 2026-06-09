@@ -66,6 +66,9 @@ type ClaudeCodeModelDef = {
 
 const OPUS_COST = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
 const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
+// Fable 5 launch pricing: $10/M input, $50/M output. cacheRead/cacheWrite follow
+// the usual 0.1x / 1.25x ratios used by the other entries.
+const FABLE_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
 
 const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 	{
@@ -104,6 +107,22 @@ const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 		contextWindow: 256_000,
 		maxTokens: 64_000,
 	},
+	{
+		id: "fable-5",
+		anthropicId: "claude-fable-5",
+		name: "Claude Code Subscription Provider / Fable 5 (1M)",
+		cost: FABLE_COST,
+		// Mythos-class model (above Opus); the launch post describes staying focused
+		// across millions of tokens, so treat it like Opus with a 1M window. NOTE: I
+		// couldn't verify the 1M long-context tier on the subscription right now
+		// because Fable is broadly rate-limited at launch (429 on every call). If
+		// small prompts start 429ing once limits ease, the 1M tier isn't included on
+		// subscription — drop contextWindow below 1M so the 1M beta is omitted (as
+		// with sonnet-4-6).
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
 ];
 
 const ANTHROPIC_ID_BY_MODEL_ID = new Map(
@@ -120,7 +139,7 @@ const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
 const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-subscription-provider.json");
-const DEFAULT_USER_AGENT = "claude-cli/2.1.100 (external, sdk-cli)";
+const DEFAULT_USER_AGENT = "claude-cli/2.1.169 (external, sdk-cli)";
 const DEFAULT_X_APP = "cli";
 const DEFAULT_MAX_TOKENS = 64_000;
 const REQUIRED_BETAS = [
@@ -170,7 +189,7 @@ function betaHeaderForModel(modelId: string): string {
 
 function buildBillingHeader(): string {
 	const cch = Math.floor(10000 + Math.random() * 90000);
-	return `x-anthropic-billing-header: cc_version=2.1.100.714; cc_entrypoint=sdk-cli; cch=${cch};`;
+	return `x-anthropic-billing-header: cc_version=2.1.169.714; cc_entrypoint=sdk-cli; cch=${cch};`;
 }
 
 function wrapSystemReminder(text: string): string {
@@ -220,19 +239,21 @@ function injectSystemRemindersIntoMessages(
 	return normalizedMessages;
 }
 
-function normalizeOpus4xThinking(payload: Record<string, unknown>) {
+function normalizeHiddenThinking(payload: Record<string, unknown>) {
 	const model = typeof payload.model === "string" ? payload.model : "";
-	const isOpus4xHidden =
+	// Opus 4.7+ and Fable 5 default thinking.display to "omitted", which makes
+	// thinking_delta events empty (only signature_delta is sent). Explicitly opt in
+	// to summarized thinking so users see reasoning in the UI, matching Opus 4.6.
+	// https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-4-7
+	const hidesThinkingByDefault =
 		model.includes("opus-4-7") ||
 		model.includes("opus-4.7") ||
 		model.includes("opus-4-8") ||
-		model.includes("opus-4.8");
-	if (!isOpus4xHidden) return;
+		model.includes("opus-4.8") ||
+		model.includes("fable-5") ||
+		model.includes("fable5");
+	if (!hidesThinkingByDefault) return;
 
-	// Opus 4.7+ defaults thinking.display to "omitted", which makes thinking_delta
-	// events empty (only signature_delta is sent). Explicitly opt in to summarized
-	// thinking so users see reasoning in the UI, matching Opus 4.6 behavior.
-	// https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-4-7
 	const thinking = payload.thinking;
 	if (thinking && typeof thinking === "object" && (thinking as Record<string, unknown>).type === "adaptive") {
 		const thinkingObj = { ...(thinking as Record<string, unknown>) };
@@ -258,7 +279,7 @@ function rewriteClaudeCodePayload(payload: unknown): unknown {
 	if (next.context_management == null) {
 		next.context_management = CLAUDE_CODE_CONTEXT_MANAGEMENT;
 	}
-	normalizeOpus4xThinking(next);
+	normalizeHiddenThinking(next);
 	return next;
 }
 
