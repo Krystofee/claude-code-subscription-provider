@@ -315,7 +315,8 @@ async function readTokenCache(): Promise<ClaudeCodeTokenBundle | null> {
 
 async function writeTokenCache(bundle: ClaudeCodeTokenBundle): Promise<void> {
 	await ensureDir(CACHE_FILE);
-	await fsp.writeFile(CACHE_FILE, `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
+	await fsp.writeFile(CACHE_FILE, `${JSON.stringify(bundle, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	await fsp.chmod(CACHE_FILE, 0o600);
 }
 
 async function clearTokenCache(): Promise<void> {
@@ -366,7 +367,7 @@ async function runClaudeAuthStatus(): Promise<ClaudeAuthStatus> {
 
 async function ensureClaudeSubscriptionAuth(interactive = false): Promise<ClaudeAuthStatus> {
 	const status = await runClaudeAuthStatus();
-	const okay = status.loggedIn && status.authMethod === "claude.ai";
+	const okay = status.loggedIn && (status.authMethod === "claude.ai" || status.authMethod === "oauth_token");
 	if (okay) return status;
 	if (interactive) {
 		throw new Error(buildLoginHint(status));

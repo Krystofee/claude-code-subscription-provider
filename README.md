@@ -91,7 +91,8 @@ Co dělá:
 - `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, Opus 4.7/4.8 `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
 - pro Opus 4.7/4.8 automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
 - access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture (probe běží na `claude-opus-4-8`)
-- token ukládá do `~/.pi/agent/cache/claude-code-subscription-provider.json`
+- podporuje běžné `claude auth login --claudeai` i setup token předaný přes `CLAUDE_CODE_OAUTH_TOKEN`
+- token ukládá s právy `0600` do `~/.pi/agent/cache/claude-code-subscription-provider.json`
 - při neplatném cached tokenu udělá refresh a request zopakuje
 - když Claude Code není přihlášené, vypíše instrukci k `claude auth login --claudeai`
 
