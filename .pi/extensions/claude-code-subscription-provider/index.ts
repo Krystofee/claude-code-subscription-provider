@@ -50,10 +50,10 @@ const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 // native `anthropic` catalog so the subscription path behaves like first-party.
 //
 // thinkingLevelMap: pi's ThinkingLevel tops out at "xhigh". Opus 4.6's adaptive
-// thinking calls its top effort "max" (xhigh -> "max"); Opus 4.7/4.8 renamed that
-// cap to "xhigh" (xhigh -> "xhigh"); Sonnet 4.6 uses pi's default mapping. All
-// four use the adaptive thinking format (forced via compat.forceAdaptiveThinking
-// in toAnthropicModel).
+// thinking calls its top effort "max" (xhigh -> "max"); newer Opus models use
+// "xhigh" directly, and Sonnet 4.6 uses pi's default mapping. All models use the
+// adaptive thinking format (forced via compat.forceAdaptiveThinking in
+// toAnthropicModel).
 type ClaudeCodeModelDef = {
 	id: string;
 	anthropicId: string;
@@ -71,6 +71,15 @@ const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
 const FABLE_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
 
 const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
+	{
+		id: "opus-5",
+		anthropicId: "claude-opus-5",
+		name: "Claude Code Subscription Provider / Opus 5 (1M)",
+		cost: OPUS_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
 	{
 		id: "opus-4-8",
 		anthropicId: "claude-opus-4-8",
@@ -250,6 +259,7 @@ function normalizeHiddenThinking(payload: Record<string, unknown>) {
 		model.includes("opus-4.7") ||
 		model.includes("opus-4-8") ||
 		model.includes("opus-4.8") ||
+		model.includes("opus-5") ||
 		model.includes("fable-5") ||
 		model.includes("fable5");
 	if (!hidesThinkingByDefault) return;
@@ -620,8 +630,8 @@ function toAnthropicModel(model: Model<Api>): Model<"anthropic-messages"> {
 		id: ANTHROPIC_ID_BY_MODEL_ID.get(model.id) ?? model.id,
 		// pi-ai 0.77 reads compat.forceAdaptiveThinking from the model to decide
 		// whether to send `thinking.type: "adaptive"` + `output_config.effort`.
-		// Every model this provider exposes (Opus 4.6/4.7/4.8, Sonnet 4.6) uses the
-		// adaptive thinking format, so force it regardless of the remapped id.
+		// Every model this provider exposes uses the adaptive thinking format, so
+		// force it regardless of the remapped id.
 		compat: {
 			...((model as Model<"anthropic-messages">).compat ?? {}),
 			forceAdaptiveThinking: true,
