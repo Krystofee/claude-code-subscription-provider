@@ -414,7 +414,9 @@ function isAuthenticationError(errorMessage?: string): boolean {
 		value.includes("invalid bearer token") ||
 		value.includes("unauthorized") ||
 		value.includes("invalid x-api-key") ||
-		value.includes("access token")
+		value.includes("access token") ||
+		value.includes("oauth_not_allowed_for_organization") ||
+		value.includes("oauth authentication is currently not allowed for this organization")
 	);
 }
 
@@ -440,6 +442,52 @@ async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> 
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 	throw new Error(`Timed out waiting for file: ${filePath}`);
+}
+
+function closeMitmProxyResources(proxy: any): void {
+	const sslServers = new Set<any>();
+	const webSocketServers = new Set<any>();
+
+	for (const entry of Object.values(proxy.sslServers ?? {}) as any[]) {
+		if (entry?.server) sslServers.add(entry.server);
+		if (entry?.wsServer) webSocketServers.add(entry.wsServer);
+	}
+	if (proxy.httpServer) sslServers.add(proxy.httpServer);
+	if (proxy.httpsServer) sslServers.add(proxy.httpsServer);
+	if (proxy.wsServer) webSocketServers.add(proxy.wsServer);
+	if (proxy.wssServer) webSocketServers.add(proxy.wssServer);
+
+	for (const webSocketServer of webSocketServers) {
+		for (const client of webSocketServer.clients ?? []) {
+			try {
+				client.terminate();
+			} catch {}
+		}
+		try {
+			webSocketServer.close();
+		} catch {}
+	}
+
+	for (const server of sslServers) {
+		try {
+			server.close();
+		} catch {}
+		try {
+			server.closeAllConnections?.();
+		} catch {}
+	}
+
+	proxy.httpAgent?.destroy();
+	proxy.httpsAgent?.destroy();
+}
+
+async function closeMitmProxy(proxy: any): Promise<void> {
+	// http-mitm-proxy creates per-host HTTPS servers asynchronously. Its close()
+	// can miss a server that finishes starting while the captured CLI is exiting.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		closeMitmProxyResources(proxy);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
 }
 
 async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
@@ -526,8 +574,9 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 		);
 	})();
 
+	let timeoutHandle: ReturnType<typeof setTimeout>;
 	const timeoutPromise = new Promise<ClaudeCodeTokenBundle>((_, reject) => {
-		setTimeout(() => {
+		timeoutHandle = setTimeout(() => {
 			reject(new Error(`Timed out waiting for Claude Code token capture after ${CAPTURE_TIMEOUT_MS}ms.`));
 		}, CAPTURE_TIMEOUT_MS);
 	});
@@ -549,6 +598,7 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 			xApp: bundle.xApp || DEFAULT_X_APP,
 		};
 	} finally {
+		clearTimeout(timeoutHandle!);
 		try {
 			if (child.exitCode == null && child.signalCode == null) {
 				child.kill("SIGTERM");
@@ -565,16 +615,7 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 				}
 			}
 		} catch {}
-		await Promise.race([
-			new Promise<void>((resolve) => {
-				try {
-					proxy.close(() => resolve());
-				} catch {
-					resolve();
-				}
-			}),
-			new Promise<void>((resolve) => setTimeout(resolve, 1000)),
-		]);
+		await closeMitmProxy(proxy);
 		await fsp.rm(caDir, { recursive: true, force: true });
 		console.log = originalConsoleLog;
 		console.warn = originalConsoleWarn;
@@ -782,5 +823,6 @@ export {
 	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
 	getTokenBundle,
+	isAuthenticationError,
 	streamClaudeCodeProvider,
 };

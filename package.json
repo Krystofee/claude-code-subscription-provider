@@ -5,7 +5,8 @@
   "main": "src/claude-network-interceptor.js",
   "scripts": {
     "interceptor": "node src/claude-network-interceptor.js",
-    "demo:hello": "node src/claude-network-interceptor.js --exec claude -- --print \"Hello world\""
+    "demo:hello": "node src/claude-network-interceptor.js --exec claude -- --print \"Hello world\"",
+    "test": "tsx --test .pi/extensions/claude-code-subscription-provider/index.test.ts"
   },
   "keywords": [
     "claude",
