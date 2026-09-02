@@ -87,10 +87,12 @@ Co dělá:
   - `claude-code-subscription-provider/opus-4-7` → `claude-opus-4-7`
   - `claude-code-subscription-provider/opus-4-6` → `claude-opus-4-6`
   - `claude-code-subscription-provider/sonnet-4-6` → `claude-sonnet-4-6` (256k — subscription tier nemá 1M na Sonnetu)
-- 1M long-context beta (`context-1m-2025-08-07`) posílá jen u modelů s 1M oknem (Opus). U Sonnetu se vynechává — jinak Anthropic vrací 429 `Usage credits are required for long context requests` i na malém promptu.
+  - `claude-code-subscription-provider/fable-5-1` → `claude-fable-5-1`
+  - `claude-code-subscription-provider/fable-5` → `claude-fable-5`
+- 1M long-context beta (`context-1m-2025-08-07`) posílá jen u modelů s 1M oknem (Opus a Fable). U Sonnetu se vynechává — jinak Anthropic vrací 429 `Usage credits are required for long context requests` i na malém promptu.
 - pro requesty používá Anthropic Messages API a u všech modelů vynutí adaptive thinking (`compat.forceAdaptiveThinking`)
-- `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, novější Opus modely `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
-- pro Opus 4.7+ a Fable 5 automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
+- `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, novější Opus a Fable modely `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
+- pro Opus 4.7+ a Fable 5+ automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
 - access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture (probe běží na `claude-opus-4-8`)
 - podporuje běžné `claude auth login --claudeai` i setup token předaný přes `CLAUDE_CODE_OAUTH_TOKEN`
 - token ukládá s právy `0600` do `~/.pi/agent/cache/claude-code-subscription-provider.json`
@@ -117,6 +119,8 @@ Pak v pi (vyber libovolný model ze sady):
 /model claude-code-subscription-provider/opus-4-7
 /model claude-code-subscription-provider/opus-4-6
 /model claude-code-subscription-provider/sonnet-4-6   # 256k context
+/model claude-code-subscription-provider/fable-5-1
+/model claude-code-subscription-provider/fable-5
 ```
 
 Volitelně lze zkontrolovat nebo refreshnout cache:

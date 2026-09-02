@@ -50,9 +50,9 @@ const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 // native `anthropic` catalog so the subscription path behaves like first-party.
 //
 // thinkingLevelMap: pi's ThinkingLevel tops out at "xhigh". Opus 4.6's adaptive
-// thinking calls its top effort "max" (xhigh -> "max"); newer Opus models use
-// "xhigh" directly, and Sonnet 4.6 uses pi's default mapping. All models use the
-// adaptive thinking format (forced via compat.forceAdaptiveThinking in
+// thinking calls its top effort "max" (xhigh -> "max"); newer Opus and Fable
+// models use "xhigh" directly, and Sonnet 4.6 uses pi's default mapping. All
+// models use the adaptive thinking format (forced via compat.forceAdaptiveThinking in
 // toAnthropicModel).
 type ClaudeCodeModelDef = {
 	id: string;
@@ -66,9 +66,9 @@ type ClaudeCodeModelDef = {
 
 const OPUS_COST = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
 const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
-// Fable 5 launch pricing: $10/M input, $50/M output. cacheRead/cacheWrite follow
-// the usual 0.1x / 1.25x ratios used by the other entries.
-const FABLE_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
+// Fable 5.1 keeps Fable 5's input/output pricing but cuts cache reads by 75%.
+const FABLE_5_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
+const FABLE_5_1_COST = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 };
 
 const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 	{
@@ -117,10 +117,19 @@ const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 		maxTokens: 64_000,
 	},
 	{
+		id: "fable-5-1",
+		anthropicId: "claude-fable-5-1",
+		name: "Claude Code Subscription Provider / Fable 5.1 (1M)",
+		cost: FABLE_5_1_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
+	{
 		id: "fable-5",
 		anthropicId: "claude-fable-5",
 		name: "Claude Code Subscription Provider / Fable 5 (1M)",
-		cost: FABLE_COST,
+		cost: FABLE_5_COST,
 		// Mythos-class model (above Opus); the launch post describes staying focused
 		// across millions of tokens, so treat it like Opus with a 1M window. NOTE: I
 		// couldn't verify the 1M long-context tier on the subscription right now
@@ -148,7 +157,8 @@ const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
 const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-subscription-provider.json");
-const DEFAULT_USER_AGENT = "claude-cli/2.1.169 (external, sdk-cli)";
+const MINIMUM_CLAUDE_CODE_VERSION = [2, 1, 251] as const;
+const DEFAULT_USER_AGENT = "claude-cli/2.1.251 (external, sdk-cli)";
 const DEFAULT_X_APP = "cli";
 const DEFAULT_MAX_TOKENS = 64_000;
 const REQUIRED_BETAS = [
@@ -189,6 +199,18 @@ function normalizeAnthropicBeta(_value?: string): string {
 	return REQUIRED_BETAS.join(",");
 }
 
+function normalizeClaudeCodeUserAgent(value?: string): string {
+	const match = value?.match(/claude-cli\/(\d+)\.(\d+)\.(\d+)/);
+	if (!value || !match) return DEFAULT_USER_AGENT;
+
+	const version = match.slice(1).map(Number);
+	for (let i = 0; i < MINIMUM_CLAUDE_CODE_VERSION.length; i++) {
+		if (version[i] > MINIMUM_CLAUDE_CODE_VERSION[i]) return value;
+		if (version[i] < MINIMUM_CLAUDE_CODE_VERSION[i]) return DEFAULT_USER_AGENT;
+	}
+	return value;
+}
+
 function betaHeaderForModel(modelId: string): string {
 	const betas = MODEL_IDS_WITH_1M.has(modelId)
 		? REQUIRED_BETAS
@@ -198,7 +220,7 @@ function betaHeaderForModel(modelId: string): string {
 
 function buildBillingHeader(): string {
 	const cch = Math.floor(10000 + Math.random() * 90000);
-	return `x-anthropic-billing-header: cc_version=2.1.169.714; cc_entrypoint=sdk-cli; cch=${cch};`;
+	return `x-anthropic-billing-header: cc_version=2.1.251.714; cc_entrypoint=sdk-cli; cch=${cch};`;
 }
 
 function wrapSystemReminder(text: string): string {
@@ -250,7 +272,7 @@ function injectSystemRemindersIntoMessages(
 
 function normalizeHiddenThinking(payload: Record<string, unknown>) {
 	const model = typeof payload.model === "string" ? payload.model : "";
-	// Opus 4.7+ and Fable 5 default thinking.display to "omitted", which makes
+	// Opus 4.7+ and Fable 5+ default thinking.display to "omitted", which makes
 	// thinking_delta events empty (only signature_delta is sent). Explicitly opt in
 	// to summarized thinking so users see reasoning in the UI, matching Opus 4.6.
 	// https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-opus-4-7
@@ -594,7 +616,7 @@ async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
 		return {
 			...bundle,
 			anthropicBeta: normalizeAnthropicBeta(bundle.anthropicBeta),
-			userAgent: bundle.userAgent || DEFAULT_USER_AGENT,
+			userAgent: normalizeClaudeCodeUserAgent(bundle.userAgent),
 			xApp: bundle.xApp || DEFAULT_X_APP,
 		};
 	} finally {
@@ -631,7 +653,7 @@ async function getTokenBundle(forceRefresh = false): Promise<ClaudeCodeTokenBund
 			return {
 				...cached,
 				anthropicBeta: normalizeAnthropicBeta(cached.anthropicBeta),
-				userAgent: cached.userAgent || DEFAULT_USER_AGENT,
+				userAgent: normalizeClaudeCodeUserAgent(cached.userAgent),
 				xApp: cached.xApp || DEFAULT_X_APP,
 			};
 		}
@@ -657,7 +679,7 @@ async function getTokenBundle(forceRefresh = false): Promise<ClaudeCodeTokenBund
 function providerHeaders(bundle: ClaudeCodeTokenBundle, modelId: string): Record<string, string> {
 	return {
 		"anthropic-beta": betaHeaderForModel(modelId),
-		"user-agent": bundle.userAgent || DEFAULT_USER_AGENT,
+		"user-agent": normalizeClaudeCodeUserAgent(bundle.userAgent),
 		"x-app": bundle.xApp || DEFAULT_X_APP,
 		"x-claude-code-session-id": randomUUID(),
 		"x-client-request-id": randomUUID(),
@@ -824,5 +846,6 @@ export {
 	captureFreshTokenBundle,
 	getTokenBundle,
 	isAuthenticationError,
+	normalizeClaudeCodeUserAgent,
 	streamClaudeCodeProvider,
 };
