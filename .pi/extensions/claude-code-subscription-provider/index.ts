@@ -65,12 +65,23 @@ type ClaudeCodeModelDef = {
 };
 
 const OPUS_COST = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
+// Opus 5.5 is a ~20% price cut on Opus 5, with cache reads down to 0.05x input.
+const OPUS_5_5_COST = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 };
 const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
 // Fable 5.1 keeps Fable 5's input/output pricing but cuts cache reads by 75%.
 const FABLE_5_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
 const FABLE_5_1_COST = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 };
 
 const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
+	{
+		id: "opus-5-5",
+		anthropicId: "claude-opus-5-5",
+		name: "Claude Code Subscription Provider / Opus 5.5 (1M)",
+		cost: OPUS_5_5_COST,
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	},
 	{
 		id: "opus-5",
 		anthropicId: "claude-opus-5",
@@ -157,8 +168,11 @@ const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
 const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-subscription-provider.json");
-const MINIMUM_CLAUDE_CODE_VERSION = [2, 1, 251] as const;
-const DEFAULT_USER_AGENT = "claude-cli/2.1.251 (external, sdk-cli)";
+// Bumped for Opus 5.5: older user agents get a 400 claude_code_version_too_old
+// ("Claude Code 2.1.251 does not support this model; version 2.1.280 or newer is
+// required"), so cached UAs below this are rewritten before we send them.
+const MINIMUM_CLAUDE_CODE_VERSION = [2, 1, 280] as const;
+const DEFAULT_USER_AGENT = "claude-cli/2.1.280 (external, sdk-cli)";
 const DEFAULT_X_APP = "cli";
 const DEFAULT_MAX_TOKENS = 64_000;
 const REQUIRED_BETAS = [
@@ -220,7 +234,7 @@ function betaHeaderForModel(modelId: string): string {
 
 function buildBillingHeader(): string {
 	const cch = Math.floor(10000 + Math.random() * 90000);
-	return `x-anthropic-billing-header: cc_version=2.1.251.714; cc_entrypoint=sdk-cli; cch=${cch};`;
+	return `x-anthropic-billing-header: cc_version=2.1.280.714; cc_entrypoint=sdk-cli; cch=${cch};`;
 }
 
 function wrapSystemReminder(text: string): string {

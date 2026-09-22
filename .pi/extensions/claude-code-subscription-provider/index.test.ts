@@ -19,15 +19,29 @@ test("does not retry unrelated permission errors", () => {
 	assert.equal(isAuthenticationError("403 permission_error: model access denied"), false);
 });
 
-test("upgrades cached user agents too old for Fable 5.1", () => {
+test("upgrades cached user agents too old for Opus 5.5", () => {
 	assert.equal(
-		normalizeClaudeCodeUserAgent("claude-cli/2.1.169 (external, sdk-cli)"),
-		"claude-cli/2.1.251 (external, sdk-cli)",
+		normalizeClaudeCodeUserAgent("claude-cli/2.1.251 (external, sdk-cli)"),
+		"claude-cli/2.1.280 (external, sdk-cli)",
 	);
 	assert.equal(
-		normalizeClaudeCodeUserAgent("claude-cli/2.1.258 (external, sdk-cli)"),
-		"claude-cli/2.1.258 (external, sdk-cli)",
+		normalizeClaudeCodeUserAgent("claude-cli/2.1.284 (external, sdk-cli)"),
+		"claude-cli/2.1.284 (external, sdk-cli)",
 	);
+});
+
+test("exposes Opus 5.5 with its Anthropic model id and pricing", () => {
+	const model = CLAUDE_CODE_MODELS.find((candidate) => candidate.id === "opus-5-5");
+
+	assert.deepEqual(model, {
+		id: "opus-5-5",
+		anthropicId: "claude-opus-5-5",
+		name: "Claude Code Subscription Provider / Opus 5.5 (1M)",
+		cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh" },
+	});
 });
 
 test("exposes Fable 5.1 with its Anthropic model id and pricing", () => {
