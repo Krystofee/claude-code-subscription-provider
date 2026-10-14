@@ -6,7 +6,8 @@
   "scripts": {
     "interceptor": "node src/claude-network-interceptor.js",
     "demo:hello": "node src/claude-network-interceptor.js --exec claude -- --print \"Hello world\"",
-    "test": "tsx --test .pi/extensions/claude-code-subscription-provider/index.test.ts"
+    "test": "tsx --test .pi/extensions/claude-code-subscription-provider/index.test.ts src/claude-network-interceptor.test.js",
+    "check": "tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --allowImportingTsExtensions --skipLibCheck --strict .pi/extensions/claude-code-subscription-provider/index.ts .pi/extensions/claude-code-subscription-provider/index.test.ts"
   },
   "keywords": [
     "claude",
@@ -24,12 +25,25 @@
       "./.pi/extensions/claude-code-subscription-provider"
     ]
   },
+  "files": [
+    ".pi/extensions/claude-code-subscription-provider/index.ts",
+    ".pi/extensions/claude-code-subscription-provider/package.json",
+    "src/claude-network-interceptor.js",
+    "scripts/replay_captured_anthropic_request.py"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.77.0",
-    "@earendil-works/pi-coding-agent": "^0.77.0",
     "http-mitm-proxy": "^1.1.0"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   }

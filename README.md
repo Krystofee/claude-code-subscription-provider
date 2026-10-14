@@ -10,6 +10,9 @@ Lokální MITM proxy pro `claude` / Claude Code, která funguje i se **subscript
 
 ## Instalace
 
+Vyžaduje Node.js 22.19+ a Pi 1.1+. Vývojové testy běží proti Pi 1.2;
+Pi balíčky jsou peer dependencies, za běhu se používá API hostujícího Pi.
+
 ```bash
 npm install
 ```
@@ -69,8 +72,9 @@ Např. pro `claude -p "Hello world"` jsem ověřil requesty na:
 
 ## Poznámky
 
-- Hlavičky jako `Authorization` jsou defaultně redigované.
-- Pokud chceš vidět i secrety, spusť s `--no-redact`.
+- Credentials se defaultně redigují v hlavičkách, URL parametrech i JSON/form tělech. Binární nebo nedekódovatelná těla se vynechávají.
+- Log adresáře mají práva `0700`, soubory `0600`. Redakce credentials neanonymizuje ostatní osobní data v promptech.
+- `--no-redact` ukládá i raw credentials; takové logy nesdílej ani necommituj.
 - Těla se ukládají maximálně do velikosti `--body-limit-bytes` na request/response.
 
 ## Pi provider: `claude-code-subscription-provider`
@@ -92,13 +96,16 @@ Co dělá:
   - `claude-code-subscription-provider/fable-5` → `claude-fable-5`
 - 1M long-context beta (`context-1m-2025-08-07`) posílá jen u modelů s 1M oknem (Opus a Fable). U Sonnetu se vynechává — jinak Anthropic vrací 429 `Usage credits are required for long context requests` i na malém promptu.
 - pro requesty používá Anthropic Messages API a u všech modelů vynutí adaptive thinking (`compat.forceAdaptiveThinking`)
-- `thinkingLevelMap` kopíruje nativní pi-ai katalog: Opus 4.6 mapuje `xhigh → "max"`, novější Opus a Fable modely `xhigh → "xhigh"`, Sonnet 4.6 jede na defaultu
+- ceny, thinking levels (včetně `max`), replay pravidla a cache lifetimes kopíruje nativní pi-ai katalog; subscription context limity zůstávají explicitní
 - user agent se normalizuje minimálně na `claude-cli/2.1.280` — Opus 5.5 na starších verzích vrací 400 `claude_code_version_too_old`
 - pro Opus 4.7+ a Fable 5+ automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
-- access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture (probe běží na `claude-opus-4-8`)
+- access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture v izolovaném workeru; probe má vypnuté MCP, tools, skills i nastavení a zachycený model request se neposílá upstream
 - podporuje běžné `claude auth login --claudeai` i setup token předaný přes `CLAUDE_CODE_OAUTH_TOKEN`
-- token ukládá s právy `0600` do `~/.pi/agent/cache/claude-code-subscription-provider.json`
-- při neplatném cached tokenu udělá refresh a request zopakuje
+- token ukládá atomicky s právy `0600` do `~/.pi/agent/cache/claude-code-subscription-provider.json` (respektuje `PI_CODING_AGENT_DIR`)
+- při neplatném cached tokenu udělá jeden refresh před viditelnou odpovědí; podporuje i `403 oauth_not_allowed_for_organization`
+- auth status i capture mají timeout a podporují cancellation; souběžní čekající sdílejí refresh
+- respektuje `maxTokens`, `cacheRetention: "none"` i system instructions; session ID a billing prefix zůstávají stabilní v rámci session
+- nativní `/compact` i `/tree` se summary používají stejný provider; auxiliary request bez reasoning zůstává validní i na always-on-thinking modelech
 - když Claude Code není přihlášené, vypíše instrukci k `claude auth login --claudeai`
 
 Instalace user-level z repozitáře:
@@ -131,7 +138,28 @@ Volitelně lze zkontrolovat nebo refreshnout cache:
 ```text
 /claude-code-auth
 /claude-code-auth refresh
+/claude-code-auth clear
 ```
+
+## Testy
+
+```bash
+npm run check
+npm test
+```
+
+Testy nepoužívají skutečné credentials ani Anthropic API. Zahrnují nativní
+`AgentSession.compact()` a `navigateTree(..., { summarize: true })`, streaming,
+tool/thinking replay, token refresh, cancellation a lokální TLS capture.
+
+`npm audit --omit=dev` zatím hlásí tři transitive findings v `http-mitm-proxy`
+(`node-forge` a `uuid`), bez dostupného kompatibilního fixu. Proxy používá UUID v4,
+nepostižené v3/v5/v6, a TLS ověřuje Node, ne RSA verifier z `node-forge`.
+Proxy binduj jen na loopback; její CA nesdílej.
+
+Použití subscription OAuth mimo oficiální Claude Code nemusí být podporované
+Anthropicem; viz [legal and compliance](https://code.claude.com/docs/en/legal-and-compliance).
+API katalog sám o sobě nepotvrzuje dostupnost modelu na subscription.
 
 ## Příklady
 

@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
 const { Proxy } = require('http-mitm-proxy');
@@ -31,7 +32,7 @@ Options:
   --log-dir <dir>              Directory for logs (default: logs)
   --env-file <path>            Shell exports file for sidecar mode (default: .claude-interceptor.env)
   --body-limit-bytes <bytes>   Max stored bytes per request/response body (default: 1048576)
-  --no-redact                  Do not redact Authorization/Cookie headers
+  --no-redact                  Store raw headers and bodies (may contain credentials)
   --quiet                      Less console output
   --exec <command>             Execute command through the proxy; trailing args go after --
   --help                       Show this help
@@ -127,7 +128,7 @@ function parseArgs(argv) {
   }
 
   if (!options.host) throw new Error('--host is required');
-  if (!Number.isInteger(options.port) || options.port <= 0) throw new Error('--port must be a positive integer');
+  if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) throw new Error('--port must be between 0 and 65535');
   if (!Number.isInteger(options.bodyLimitBytes) || options.bodyLimitBytes <= 0) {
     throw new Error('--body-limit-bytes must be a positive integer');
   }
@@ -136,7 +137,48 @@ function parseArgs(argv) {
 }
 
 function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dirPath, 0o700);
+}
+
+function writePrivateFile(filePath, content, append = false) {
+  fs.writeFileSync(filePath, content, { mode: 0o600, flag: append ? 'a' : 'w' });
+  fs.chmodSync(filePath, 0o600);
+}
+
+function isSecretField(key) {
+  return /^(accessToken|refreshToken|idToken|token|apiKey|anthropicApiKey|clientSecret|password|authorization|cookie|setCookie)$/i.test(String(key).replace(/[^a-z]/gi, ''));
+}
+
+function redactText(text, enabled = true) {
+  if (!enabled) return text;
+  return text
+    .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-ant-[a-z0-9_-]+/gi, '[REDACTED]')
+    // Also handle malformed/truncated JSON and JSON embedded in SSE frames.
+    .replace(/("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|client[_-]?secret|password|authorization)"\s*:\s*")(?:[^"\\]|\\.)*("|$)/gi, '$1[REDACTED]$2');
+}
+
+function redactJson(value) {
+  if (Array.isArray(value)) return value.map(redactJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, isSecretField(key) ? '[REDACTED]' : redactJson(item)]));
+  }
+  return typeof value === 'string' ? redactText(value) : value;
+}
+
+function redactUrl(value, enabled = true) {
+  if (!enabled) return value;
+  try {
+    const absolute = /^https?:\/\//i.test(value);
+    const url = new URL(value, 'http://redaction.invalid');
+    for (const key of url.searchParams.keys()) {
+      if (isSecretField(key)) url.searchParams.set(key, '[REDACTED]');
+    }
+    if (url.username) url.username = '[REDACTED]';
+    if (url.password) url.password = '[REDACTED]';
+    return redactText(absolute ? url.toString() : url.pathname + url.search);
+  } catch { return redactText(value); }
 }
 
 function isoNow() {
@@ -144,7 +186,7 @@ function isoNow() {
 }
 
 function appendNdjson(filePath, payload) {
-  fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`);
+  writePrivateFile(filePath, `${JSON.stringify(payload)}\n`, true);
 }
 
 function redactHeaders(headers, enabled) {
@@ -159,10 +201,10 @@ function redactHeaders(headers, enabled) {
   ]);
 
   for (const [key, value] of Object.entries(headers || {})) {
-    if (enabled && secretHeaderNames.has(String(key).toLowerCase())) {
+    if (enabled && (secretHeaderNames.has(String(key).toLowerCase()) || isSecretField(key) || /(?:^|-)token$/i.test(key))) {
       result[key] = '[REDACTED]';
     } else {
-      result[key] = value;
+      result[key] = typeof value === 'string' ? redactText(value, enabled) : value;
     }
   }
 
@@ -206,7 +248,7 @@ function normalizeHeaderValue(value) {
   return value == null ? '' : String(value);
 }
 
-function maybeDecompress(buffer, contentEncoding) {
+function maybeDecompress(buffer, contentEncoding, limitBytes) {
   const encoding = normalizeHeaderValue(contentEncoding).toLowerCase().trim();
   if (!encoding || encoding === 'identity') {
     return { buffer, decompressed: false, encoding };
@@ -214,13 +256,13 @@ function maybeDecompress(buffer, contentEncoding) {
 
   try {
     if (encoding.includes('gzip')) {
-      return { buffer: zlib.gunzipSync(buffer), decompressed: true, encoding };
+      return { buffer: zlib.gunzipSync(buffer, { maxOutputLength: limitBytes }), decompressed: true, encoding };
     }
     if (encoding.includes('deflate')) {
-      return { buffer: zlib.inflateSync(buffer), decompressed: true, encoding };
+      return { buffer: zlib.inflateSync(buffer, { maxOutputLength: limitBytes }), decompressed: true, encoding };
     }
     if (encoding.includes('br')) {
-      return { buffer: zlib.brotliDecompressSync(buffer), decompressed: true, encoding };
+      return { buffer: zlib.brotliDecompressSync(buffer, { maxOutputLength: limitBytes }), decompressed: true, encoding };
     }
   } catch (error) {
     return {
@@ -231,13 +273,13 @@ function maybeDecompress(buffer, contentEncoding) {
     };
   }
 
-  return { buffer, decompressed: false, encoding };
+  return { buffer, decompressed: false, encoding, decompressionError: `Unsupported content encoding: ${encoding}` };
 }
 
-function summarizeBody(buffer, headers, truncated) {
+function summarizeBody(buffer, headers, truncated, redact = true, limitBytes = DEFAULTS.bodyLimitBytes) {
   const contentType = normalizeHeaderValue(headers?.['content-type']);
   const contentEncoding = normalizeHeaderValue(headers?.['content-encoding']);
-  const { buffer: processedBuffer, decompressed, decompressionError } = maybeDecompress(buffer, contentEncoding);
+  const { buffer: processedBuffer, decompressed, decompressionError } = maybeDecompress(buffer, contentEncoding, limitBytes);
   const textLike = isLikelyText(contentType);
 
   const summary = {
@@ -252,6 +294,12 @@ function summarizeBody(buffer, headers, truncated) {
     summary.decompressionError = decompressionError;
   }
 
+  if (redact && (!textLike || decompressionError)) {
+    summary.format = 'text';
+    summary.preview = summary.fullText = '[BODY OMITTED: cannot safely redact]';
+    return summary;
+  }
+
   if (textLike) {
     let text = processedBuffer.toString('utf8');
     summary.format = 'text';
@@ -259,13 +307,19 @@ function summarizeBody(buffer, headers, truncated) {
     if (contentType.toLowerCase().includes('json')) {
       try {
         const parsed = JSON.parse(text);
-        text = JSON.stringify(parsed, null, 2);
+        text = JSON.stringify(redact ? redactJson(parsed) : parsed, null, 2);
         summary.format = 'json';
       } catch {
         summary.format = 'text';
       }
     }
 
+    if (redact && contentType.includes('x-www-form-urlencoded')) {
+      const fields = new URLSearchParams(text);
+      for (const key of fields.keys()) if (isSecretField(key)) fields.set(key, '[REDACTED]');
+      text = fields.toString();
+    }
+    text = redactText(text, redact);
     summary.preview = text.length > 4000 ? `${text.slice(0, 4000)}\n…[truncated preview]` : text;
     summary.fullText = text;
     return summary;
@@ -292,12 +346,13 @@ function writeBodyFile(baseDir, id, direction, summary) {
   const ext = bodyExtension(summary);
   const fileName = `${safeFilePart(id)}-${direction}.${ext}`;
   const filePath = path.join(baseDir, fileName);
-  fs.writeFileSync(filePath, summary.fullText || '');
+  writePrivateFile(filePath, summary.fullText || '');
   return filePath;
 }
 
 function buildEnvFileContent({ host, port, caPath }) {
-  return `# Generated by claude-network-interceptor\nexport HTTP_PROXY=http://${host}:${port}\nexport HTTPS_PROXY=http://${host}:${port}\nexport NODE_EXTRA_CA_CERTS=${caPath}\n`;
+  const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  return `# Generated by claude-network-interceptor\nexport HTTP_PROXY=${quote(`http://${host}:${port}`)}\nexport HTTPS_PROXY=${quote(`http://${host}:${port}`)}\nexport NODE_EXTRA_CA_CERTS=${quote(caPath)}\n`;
 }
 
 function logConsole(enabled, message) {
@@ -342,22 +397,23 @@ async function main() {
 
   proxy.onError((ctx, error, errorKind) => {
     const requestId = ctx?.__requestMeta?.id || null;
+    const message = redactText(error?.message || String(error), options.redact);
     writeEvent({
       type: 'proxy_error',
       at: isoNow(),
       requestId,
       errorKind,
-      message: error?.message || String(error),
+      message,
     });
 
-    logConsole(!options.quiet, `[error] ${errorKind}${requestId ? ` (${requestId})` : ''}: ${error?.message || error}`);
+    logConsole(!options.quiet, `[error] ${errorKind}${requestId ? ` (${requestId})` : ''}: ${message}`);
   });
 
   proxy.onConnect((req, socket, head, callback) => {
     writeEvent({
       type: 'connect',
       at: isoNow(),
-      target: req.url,
+      target: redactUrl(req.url, options.redact),
       headers: redactHeaders(req.headers || {}, options.redact),
     });
     callback();
@@ -377,7 +433,7 @@ async function main() {
       startedAtIso,
       method: ctx.clientToProxyRequest.method,
       host: ctx.clientToProxyRequest.headers.host,
-      path: ctx.clientToProxyRequest.url,
+      path: redactUrl(ctx.clientToProxyRequest.url, options.redact),
       protocol: ctx.isSSL ? 'https' : 'http',
       requestHeaders: reqHeaders,
       reqBucket,
@@ -412,8 +468,8 @@ async function main() {
     ctx.onResponseEnd((innerCtx, cb) => {
       const finishedAt = Date.now();
       const responseHeaders = redactHeaders(innerCtx.serverToProxyResponse?.headers || {}, options.redact);
-      const requestBodySummary = summarizeBody(Buffer.concat(reqBucket.chunks), meta.requestHeaders, reqBucket.truncated);
-      const responseBodySummary = summarizeBody(Buffer.concat(resBucket.chunks), responseHeaders, resBucket.truncated);
+      const requestBodySummary = summarizeBody(Buffer.concat(reqBucket.chunks), meta.requestHeaders, reqBucket.truncated, options.redact, options.bodyLimitBytes);
+      const responseBodySummary = summarizeBody(Buffer.concat(resBucket.chunks), responseHeaders, resBucket.truncated, options.redact, options.bodyLimitBytes);
       const requestBodyFile = writeBodyFile(bodiesDir, id, 'request', requestBodySummary);
       const responseBodyFile = writeBodyFile(bodiesDir, id, 'response', responseBodySummary);
 
@@ -476,9 +532,10 @@ async function main() {
     );
   });
 
+  options.port = proxy.httpPort;
   const caPath = path.join(caDir, 'certs', 'ca.pem');
   const envFileContent = buildEnvFileContent({ host: options.host, port: options.port, caPath });
-  fs.writeFileSync(envFilePath, envFileContent);
+  writePrivateFile(envFilePath, envFileContent);
 
   logConsole(!options.quiet, `Proxy listening on http://${options.host}:${options.port}`);
   logConsole(!options.quiet, `CA certificate: ${caPath}`);
@@ -535,12 +592,17 @@ async function main() {
   process.on('SIGINT', () => forwardSignal('SIGINT'));
   process.on('SIGTERM', () => forwardSignal('SIGTERM'));
 
+  child.on('error', (error) => {
+    logConsole(!options.quiet, `Unable to execute ${options.execCommand}: ${error.code || 'spawn failed'}`);
+    shutdown(1);
+  });
+
   child.on('exit', (code, signal) => {
     writeEvent({
       type: 'exec_finished',
       at: isoNow(),
       command: options.execCommand,
-      args: options.execArgs,
+      args: options.execArgs.map((arg) => redactText(arg, options.redact)),
       code,
       signal,
     });
@@ -558,7 +620,121 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  console.error(error.stack || error.message || String(error));
-  process.exit(1);
-});
+async function closeCaptureProxy(proxy) {
+  // Per-host HTTPS servers may finish starting after proxy.close() has run.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const servers = [proxy.httpServer, proxy.httpsServer];
+    const sockets = [proxy.wsServer, proxy.wssServer];
+    for (const entry of Object.values(proxy.sslServers || {})) {
+      servers.push(entry.server);
+      sockets.push(entry.wsServer);
+    }
+    for (const socket of sockets.filter(Boolean)) {
+      for (const client of socket.clients || []) client.terminate();
+      try { socket.close(); } catch {}
+    }
+    for (const server of servers.filter(Boolean)) {
+      try { server.close(); server.closeAllConnections?.(); } catch {}
+    }
+    proxy.httpAgent?.destroy();
+    proxy.httpsAgent?.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function captureClaudeCodeToken(model, signal) {
+  signal?.throwIfAborted();
+  const caDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-claude-code-subscription-provider-ca-'));
+  const proxy = new Proxy();
+  let child;
+  let stopChildTimer;
+  let timer;
+  let onAbort;
+  let finished = false;
+  try {
+    return await new Promise((resolve, reject) => {
+      onAbort = () => reject(signal.reason || new Error('Token capture aborted'));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(() => reject(new Error('Claude Code token capture timed out')), 90_000);
+      proxy.onError(() => {});
+      proxy.onRequest((ctx, callback) => {
+        const headers = ctx.clientToProxyRequest.headers;
+        if (headers.host === 'api.anthropic.com' && ctx.clientToProxyRequest.url.startsWith('/v1/messages') && headers.authorization?.startsWith('Bearer ')) {
+          resolve({
+            accessToken: headers.authorization.slice(7),
+            anthropicBeta: headers['anthropic-beta'],
+            userAgent: headers['user-agent'],
+            xApp: headers['x-app'],
+          });
+          // Capturing headers is enough; don't bill a throwaway model request.
+          ctx.proxyToClientResponse.writeHead(503, { 'content-type': 'application/json' });
+          ctx.proxyToClientResponse.end('{"error":{"type":"api_error","message":"Auth capture complete"}}');
+          return;
+        }
+        callback();
+      });
+      proxy.listen({ host: '127.0.0.1', port: 0, sslCaDir: caDir }, (error) => {
+        if (finished) {
+          closeCaptureProxy(proxy).finally(() => fs.rmSync(caDir, { recursive: true, force: true })).catch(() => {});
+          return;
+        }
+        if (error) { reject(error); return; }
+        if (signal?.aborted) { onAbort(); return; }
+        const proxyUrl = `http://127.0.0.1:${proxy.httpPort}`;
+        child = spawn('claude', [
+          '--model', model, '--print', 'Reply with exactly OK.',
+          '--no-session-persistence', '--setting-sources', '', '--disable-slash-commands', '--tools', '',
+          '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+        ], {
+          cwd: caDir,
+          stdio: ['ignore', 'ignore', 'ignore'],
+          env: {
+            ...process.env,
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+            HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl,
+            http_proxy: proxyUrl, https_proxy: proxyUrl,
+            NO_PROXY: '', no_proxy: '',
+            NODE_EXTRA_CA_CERTS: path.join(caDir, 'certs', 'ca.pem'),
+          },
+        });
+        child.on('error', reject);
+        child.on('exit', (code) => reject(new Error(`Claude Code exited before token capture (${code})`)));
+      });
+    });
+  } finally {
+    finished = true;
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+    if (child && child.exitCode == null && child.signalCode == null) {
+      await new Promise((resolve) => {
+        child.once('exit', resolve);
+        stopChildTimer = setTimeout(() => child.kill('SIGKILL'), 1_000);
+        child.kill('SIGTERM');
+      });
+      clearTimeout(stopChildTimer);
+    }
+    await closeCaptureProxy(proxy);
+    fs.rmSync(caDir, { recursive: true, force: true });
+  }
+}
+
+module.exports = { redactHeaders, redactUrl, summarizeBody, writeBodyFile, buildEnvFileContent, captureClaudeCodeToken };
+
+if (require.main === module) {
+  if (process.argv[2] === '--capture-token') {
+    // Silence only this isolated worker, never the parent Pi process.
+    console.log = console.info = console.debug = () => {};
+    const controller = new AbortController();
+    process.once('SIGTERM', () => controller.abort());
+    process.once('SIGINT', () => controller.abort());
+    const modelIndex = process.argv.indexOf('--model');
+    captureClaudeCodeToken(modelIndex < 0 ? 'claude-opus-4-8' : process.argv[modelIndex + 1], controller.signal)
+      .then((bundle) => process.stdout.write(`${JSON.stringify(bundle)}\n`))
+      .catch(() => { process.exitCode = 1; });
+  } else {
+    main().catch((error) => {
+      console.error(error.stack || error.message || String(error));
+      process.exit(1);
+    });
+  }
+}

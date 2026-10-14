@@ -1,27 +1,22 @@
-import { randomUUID } from "node:crypto";
-import { once } from "node:events";
-import fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import {
 	createAssistantMessageEventStream,
-	streamSimpleAnthropic,
+	anthropicMessagesApi,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
-	type Context,
+	type TranscriptContext,
 	type Model,
 	type SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-
-const require = createRequire(import.meta.url);
-const { Proxy } = require("http-mitm-proxy");
 
 type ClaudeAuthStatus = {
 	loggedIn?: boolean;
@@ -40,20 +35,13 @@ type ClaudeCodeTokenBundle = {
 	anthropicBeta?: string;
 	userAgent?: string;
 	xApp?: string;
+	authFingerprint?: string;
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 
-// The set of models this provider exposes. Each entry maps a pi-facing id (what
-// shows up in `/model`) to the real Anthropic model id we send upstream. The
-// cost / contextWindow / maxTokens / thinkingLevelMap values mirror pi-ai 0.77's
-// native `anthropic` catalog so the subscription path behaves like first-party.
-//
-// thinkingLevelMap: pi's ThinkingLevel tops out at "xhigh". Opus 4.6's adaptive
-// thinking calls its top effort "max" (xhigh -> "max"); newer Opus and Fable
-// models use "xhigh" directly, and Sonnet 4.6 uses pi's default mapping. All
-// models use the adaptive thinking format (forced via compat.forceAdaptiveThinking in
-// toAnthropicModel).
+// Subscription context limits differ from the API catalog (notably Sonnet).
+// Keep those explicit, but inherit API capabilities and thinking levels from Pi.
 type ClaudeCodeModelDef = {
 	id: string;
 	anthropicId: string;
@@ -62,67 +50,50 @@ type ClaudeCodeModelDef = {
 	contextWindow: number;
 	maxTokens: number;
 	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+	compat?: Model<"anthropic-messages">["compat"];
+	promptCache?: Model<Api>["promptCache"];
 };
 
-const OPUS_COST = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
-// Opus 5.5 is a ~20% price cut on Opus 5, with cache reads down to 0.05x input.
-const OPUS_5_5_COST = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 };
-const SONNET_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
-// Fable 5.1 keeps Fable 5's input/output pricing but cuts cache reads by 75%.
-const FABLE_5_COST = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
-const FABLE_5_1_COST = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 };
-
-const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
+const CLAUDE_CODE_MODEL_DEFS = [
 	{
 		id: "opus-5-5",
 		anthropicId: "claude-opus-5-5",
 		name: "Claude Code Subscription Provider / Opus 5.5 (1M)",
-		cost: OPUS_5_5_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	{
 		id: "opus-5",
 		anthropicId: "claude-opus-5",
 		name: "Claude Code Subscription Provider / Opus 5 (1M)",
-		cost: OPUS_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	{
 		id: "opus-4-8",
 		anthropicId: "claude-opus-4-8",
 		name: "Claude Code Subscription Provider / Opus 4.8 (1M)",
-		cost: OPUS_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	{
 		id: "opus-4-7",
 		anthropicId: "claude-opus-4-7",
 		name: "Claude Code Subscription Provider / Opus 4.7 (1M)",
-		cost: OPUS_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	{
 		id: "opus-4-6",
 		anthropicId: "claude-opus-4-6",
 		name: "Claude Code Subscription Provider / Opus 4.6 (1M)",
-		cost: OPUS_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "max" },
 	},
 	{
 		id: "sonnet-4-6",
 		anthropicId: "claude-sonnet-4-6",
 		name: "Claude Code Subscription Provider / Sonnet 4.6 (256k)",
-		cost: SONNET_COST,
 		// Subscription tier caps Sonnet at 256k context (1M requires usage credits).
 		contextWindow: 256_000,
 		maxTokens: 64_000,
@@ -131,16 +102,13 @@ const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 		id: "fable-5-1",
 		anthropicId: "claude-fable-5-1",
 		name: "Claude Code Subscription Provider / Fable 5.1 (1M)",
-		cost: FABLE_5_1_COST,
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 	{
 		id: "fable-5",
 		anthropicId: "claude-fable-5",
 		name: "Claude Code Subscription Provider / Fable 5 (1M)",
-		cost: FABLE_5_COST,
 		// Mythos-class model (above Opus); the launch post describes staying focused
 		// across millions of tokens, so treat it like Opus with a 1M window. NOTE: I
 		// couldn't verify the 1M long-context tier on the subscription right now
@@ -150,9 +118,22 @@ const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = [
 		// with sonnet-4-6).
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		thinkingLevelMap: { xhigh: "xhigh" },
 	},
 ];
+
+const nativeModels = new Map(getBuiltinModels("anthropic").map((model) => [model.id, model]));
+const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = CLAUDE_CODE_MODEL_DEFS.map((model) => {
+	const native = nativeModels.get(model.anthropicId);
+	if (!native) throw new Error(`Pi's Anthropic catalog is missing ${model.anthropicId}. Update Pi.`);
+	return {
+		...model,
+		cost: native.cost,
+		thinkingLevelMap: native.thinkingLevelMap,
+		promptCache: native.promptCache,
+		// Fallbacks need subscription availability checks; don't silently request API-only models.
+		compat: { ...native.compat, allowedFallbackModels: undefined },
+	};
+});
 
 const ANTHROPIC_ID_BY_MODEL_ID = new Map(
 	CLAUDE_CODE_MODELS.map((model): [string, string] => [model.id, model.anthropicId]),
@@ -163,11 +144,15 @@ const ANTHROPIC_ID_BY_MODEL_ID = new Map(
 // any subscription model works, so we pin it to the default.
 const DEFAULT_MODEL_ID = "opus-4-8";
 const CAPTURE_ANTHROPIC_MODEL = ANTHROPIC_ID_BY_MODEL_ID.get(DEFAULT_MODEL_ID) ?? "claude-opus-4-8";
-const CAPTURE_PROMPT = "Reply with exactly OK.";
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
-const CACHE_FILE = path.join(os.homedir(), ".pi", "agent", "cache", "claude-code-subscription-provider.json");
+const CACHE_FILE = path.join(
+	process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
+	"cache", "claude-code-subscription-provider.json",
+);
+const CAPTURE_SCRIPT = fileURLToPath(new URL("../../../src/claude-network-interceptor.js", import.meta.url));
+const DEFAULT_SESSION_ID = randomUUID();
 // Bumped for Opus 5.5: older user agents get a 400 claude_code_version_too_old
 // ("Claude Code 2.1.251 does not support this model; version 2.1.280 or newer is
 // required"), so cached UAs below this are rewritten before we send them.
@@ -199,7 +184,30 @@ const CLAUDE_CODE_CONTEXT_MANAGEMENT = {
 	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
 };
 
-let inflightTokenRefresh: Promise<ClaudeCodeTokenBundle> | null = null;
+let inflightTokenRefresh: {
+	promise: Promise<ClaudeCodeTokenBundle>;
+	controller: AbortController;
+	waiters: number;
+	authFingerprint?: string;
+} | null = null;
+
+async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => {});
+		signal.throwIfAborted();
+	}
+	let onAbort: () => void = () => {};
+	const aborted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([promise, aborted]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
 
 function splitBetas(value?: string): string[] {
 	if (!value) return [];
@@ -225,15 +233,21 @@ function normalizeClaudeCodeUserAgent(value?: string): string {
 	return value;
 }
 
-function betaHeaderForModel(modelId: string): string {
-	const betas = MODEL_IDS_WITH_1M.has(modelId)
-		? REQUIRED_BETAS
+function betaHeaderForModel(model: Model<Api>, extra?: string): string {
+	const betas = MODEL_IDS_WITH_1M.has(model.id)
+		? [...REQUIRED_BETAS]
 		: REQUIRED_BETAS.filter((beta) => beta !== CONTEXT_1M_BETA);
-	return betas.join(",");
+	const compat = (model as Model<"anthropic-messages">).compat;
+	if (compat?.supportsMidConvoEffort) {
+		betas.push("mid-conversation-output-config-2026-07-01", "thinking-binding-controls-2026-08-01");
+	}
+	if (compat?.supportsMidConvoToolChanges) betas.push("inline-tools-2026-09-15");
+	return [...new Set([...betas, ...splitBetas(extra)])].join(",");
 }
 
-function buildBillingHeader(): string {
-	const cch = Math.floor(10000 + Math.random() * 90000);
+function buildBillingHeader(sessionId: string): string {
+	// A changing system prefix invalidates signed thinking replay and prompt caches.
+	const cch = 10000 + (parseInt(createHash("sha256").update(sessionId).digest("hex").slice(0, 8), 16) % 90000);
 	return `x-anthropic-billing-header: cc_version=2.1.280.714; cc_entrypoint=sdk-cli; cch=${cch};`;
 }
 
@@ -252,6 +266,7 @@ function toContentArray(content: unknown): Array<Record<string, unknown>> {
 }
 
 function extractSystemReminderBlocks(system: unknown): Array<Record<string, unknown>> {
+	if (typeof system === "string") system = [{ type: "text", text: system }];
 	if (!Array.isArray(system)) return [];
 	return system.flatMap((block) => {
 		if (!block || typeof block !== "object") return [];
@@ -310,20 +325,17 @@ function normalizeHiddenThinking(payload: Record<string, unknown>) {
 	}
 }
 
-function rewriteClaudeCodePayload(payload: unknown): unknown {
+function rewriteClaudeCodePayload(payload: unknown, sessionId: string = DEFAULT_SESSION_ID): unknown {
 	if (!payload || typeof payload !== "object") return payload;
 	const next = structuredClone(payload as Record<string, unknown>);
 	const reminderBlocks = extractSystemReminderBlocks(next.system);
 	next.system = [
-		{ type: "text", text: buildBillingHeader() },
+		{ type: "text", text: buildBillingHeader(sessionId) },
 		{ type: "text", text: CLAUDE_CODE_SDK_SYSTEM_TEXT },
 	];
 	next.messages = injectSystemRemindersIntoMessages(next.messages, reminderBlocks);
-	if (typeof next.max_tokens !== "number" || next.max_tokens < DEFAULT_MAX_TOKENS) {
-		next.max_tokens = DEFAULT_MAX_TOKENS;
-	}
 	if (next.context_management == null) {
-		next.context_management = CLAUDE_CODE_CONTEXT_MANAGEMENT;
+		next.context_management = structuredClone(CLAUDE_CODE_CONTEXT_MANAGEMENT);
 	}
 	normalizeHiddenThinking(next);
 	return next;
@@ -352,7 +364,7 @@ async function readTokenCache(): Promise<ClaudeCodeTokenBundle | null> {
 	try {
 		const raw = await fsp.readFile(CACHE_FILE, "utf8");
 		const parsed = JSON.parse(raw) as ClaudeCodeTokenBundle;
-		if (!parsed?.accessToken) return null;
+		if (typeof parsed?.accessToken !== "string" || !Number.isFinite(parsed.expiresAt) || !Number.isFinite(parsed.capturedAt)) return null;
 		return parsed;
 	} catch {
 		return null;
@@ -361,8 +373,13 @@ async function readTokenCache(): Promise<ClaudeCodeTokenBundle | null> {
 
 async function writeTokenCache(bundle: ClaudeCodeTokenBundle): Promise<void> {
 	await ensureDir(CACHE_FILE);
-	await fsp.writeFile(CACHE_FILE, `${JSON.stringify(bundle, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	await fsp.chmod(CACHE_FILE, 0o600);
+	const temporary = `${CACHE_FILE}.${randomUUID()}.tmp`;
+	try {
+		await fsp.writeFile(temporary, `${JSON.stringify(bundle, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		await fsp.rename(temporary, CACHE_FILE);
+	} finally {
+		await fsp.rm(temporary, { force: true });
+	}
 }
 
 async function clearTokenCache(): Promise<void> {
@@ -381,44 +398,51 @@ function buildLoginHint(status?: ClaudeAuthStatus): string {
 	].join(" ");
 }
 
-async function runClaudeAuthStatus(): Promise<ClaudeAuthStatus> {
+async function runJsonCommand<T>(
+	command: string, args: string[], signal?: AbortSignal, timeoutMs = 15_000,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<T> {
+	signal?.throwIfAborted();
 	return await new Promise((resolve, reject) => {
-		const child = spawn("claude", ["auth", "status"], {
-			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
-		});
-
+		const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env });
 		let stdout = "";
-		let stderr = "";
+		let stopped = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const stop = (error: unknown) => {
+			if (stopped) return;
+			stopped = true;
+			child.kill("SIGTERM");
+			killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+			killTimer.unref();
+			reject(error);
+		};
+		const onAbort = () => stop(signal?.reason ?? new Error("Request aborted"));
+		const timer = setTimeout(() => stop(new Error(`${command} timed out after ${timeoutMs}ms.`)), timeoutMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		child.stdout.on("data", (chunk) => {
 			stdout += String(chunk);
+			if (stdout.length > 64_000) stop(new Error(`${command} returned too much output.`));
 		});
-		child.stderr.on("data", (chunk) => {
-			stderr += String(chunk);
-		});
+		// The capture worker owns proxy debug output. Never replay its raw logs or tokens in Pi.
+		child.stderr.resume();
 		child.on("error", reject);
-		child.on("exit", (code) => {
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			clearTimeout(killTimer);
+			signal?.removeEventListener("abort", onAbort);
+			if (stopped) return;
 			if (code !== 0) {
-				reject(new Error(`claude auth status failed (${code ?? "unknown"}): ${stderr || stdout}`));
+				reject(new Error(`${command} failed (${code ?? "signal"}). Check Claude Code login and connectivity.`));
 				return;
 			}
-			try {
-				resolve(JSON.parse(stdout));
-			} catch (error) {
-				reject(new Error(`Failed to parse claude auth status output: ${stdout || stderr}`));
-			}
+			try { resolve(JSON.parse(stdout) as T); }
+			catch { reject(new Error(`${command} returned invalid JSON.`)); }
 		});
 	});
 }
 
-async function ensureClaudeSubscriptionAuth(interactive = false): Promise<ClaudeAuthStatus> {
-	const status = await runClaudeAuthStatus();
-	const okay = status.loggedIn && (status.authMethod === "claude.ai" || status.authMethod === "oauth_token");
-	if (okay) return status;
-	if (interactive) {
-		throw new Error(buildLoginHint(status));
-	}
-	throw new Error(buildLoginHint(status));
+async function runClaudeAuthStatus(signal?: AbortSignal, env?: NodeJS.ProcessEnv): Promise<ClaudeAuthStatus> {
+	return runJsonCommand("claude", ["auth", "status"], signal, 15_000, env);
 }
 
 function createProviderError(model: Model<Api>, message: string, aborted = false): AssistantMessage {
@@ -456,214 +480,38 @@ function isAuthenticationError(errorMessage?: string): boolean {
 	);
 }
 
-async function getFreePort(): Promise<number> {
-	return await new Promise((resolve, reject) => {
-		const server = net.createServer();
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			const port = typeof address === "object" && address ? address.port : 0;
-			server.close((error) => {
-				if (error) reject(error);
-				else resolve(port);
-			});
-		});
-		server.on("error", reject);
-	});
-}
-
-async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> {
-	const started = Date.now();
-	while (Date.now() - started < timeoutMs) {
-		if (fs.existsSync(filePath)) return;
-		await new Promise((resolve) => setTimeout(resolve, 50));
+async function captureFreshTokenBundle(signal?: AbortSignal, env?: NodeJS.ProcessEnv): Promise<ClaudeCodeTokenBundle> {
+	const status = await runClaudeAuthStatus(signal, env);
+	if (!status.loggedIn || !["claude.ai", "oauth_token"].includes(status.authMethod ?? "")) {
+		throw new Error(buildLoginHint(status));
 	}
-	throw new Error(`Timed out waiting for file: ${filePath}`);
-}
-
-function closeMitmProxyResources(proxy: any): void {
-	const sslServers = new Set<any>();
-	const webSocketServers = new Set<any>();
-
-	for (const entry of Object.values(proxy.sslServers ?? {}) as any[]) {
-		if (entry?.server) sslServers.add(entry.server);
-		if (entry?.wsServer) webSocketServers.add(entry.wsServer);
-	}
-	if (proxy.httpServer) sslServers.add(proxy.httpServer);
-	if (proxy.httpsServer) sslServers.add(proxy.httpsServer);
-	if (proxy.wsServer) webSocketServers.add(proxy.wsServer);
-	if (proxy.wssServer) webSocketServers.add(proxy.wssServer);
-
-	for (const webSocketServer of webSocketServers) {
-		for (const client of webSocketServer.clients ?? []) {
-			try {
-				client.terminate();
-			} catch {}
-		}
-		try {
-			webSocketServer.close();
-		} catch {}
-	}
-
-	for (const server of sslServers) {
-		try {
-			server.close();
-		} catch {}
-		try {
-			server.closeAllConnections?.();
-		} catch {}
-	}
-
-	proxy.httpAgent?.destroy();
-	proxy.httpsAgent?.destroy();
-}
-
-async function closeMitmProxy(proxy: any): Promise<void> {
-	// http-mitm-proxy creates per-host HTTPS servers asynchronously. Its close()
-	// can miss a server that finishes starting while the captured CLI is exiting.
-	for (let attempt = 0; attempt < 5; attempt++) {
-		closeMitmProxyResources(proxy);
-		await new Promise((resolve) => setTimeout(resolve, 100));
-	}
-}
-
-async function captureFreshTokenBundle(): Promise<ClaudeCodeTokenBundle> {
-	await ensureClaudeSubscriptionAuth(false);
-
-	const port = await getFreePort();
-	const caDir = await fsp.mkdtemp(path.join(os.tmpdir(), "pi-claude-code-subscription-provider-ca-"));
-	const proxy = new Proxy();
-	const proxyHost = "127.0.0.1";
-	const proxyUrl = `http://${proxyHost}:${port}`;
-	const caPath = path.join(caDir, "certs", "ca.pem");
-	let captured: ClaudeCodeTokenBundle | null = null;
-	let settled = false;
-
-	const bundlePromise = new Promise<ClaudeCodeTokenBundle>((resolve, reject) => {
-		proxy.onError((_ctx: unknown, error: Error) => {
-			if (!settled && error) {
-				// Ignore noisy tunnel resets; actual failure will come from timeout/child exit.
-			}
-		});
-
-		proxy.onRequest((ctx: any, callback: () => void) => {
-			try {
-				const host = getHeader(ctx?.clientToProxyRequest?.headers, "host");
-				const url = String(ctx?.clientToProxyRequest?.url || "");
-				const authHeader = getHeader(ctx?.clientToProxyRequest?.headers, "authorization");
-				if (host === "api.anthropic.com" && url.startsWith("/v1/messages") && authHeader?.startsWith("Bearer ")) {
-					captured = {
-						accessToken: authHeader.slice("Bearer ".length),
-						capturedAt: Date.now(),
-						expiresAt: Date.now() + TOKEN_TTL_MS,
-						anthropicBeta: getHeader(ctx.clientToProxyRequest.headers, "anthropic-beta"),
-						userAgent: getHeader(ctx.clientToProxyRequest.headers, "user-agent"),
-						xApp: getHeader(ctx.clientToProxyRequest.headers, "x-app"),
-					};
-					if (!settled) {
-						settled = true;
-						resolve(captured);
-					}
-				}
-			} finally {
-				callback();
-			}
-		});
-
-		proxy.listen({ host: proxyHost, port, sslCaDir: caDir }, (error: Error | undefined) => {
-			if (error && !settled) {
-				settled = true;
-				reject(error);
-			}
-		});
-	});
-
-	await waitForFile(caPath);
-
-	const child = spawn(
-		"claude",
-		["--model", CAPTURE_ANTHROPIC_MODEL, "--print", CAPTURE_PROMPT],
-		{
-			stdio: ["ignore", "pipe", "pipe"],
-			env: {
-				...process.env,
-				HTTP_PROXY: proxyUrl,
-				HTTPS_PROXY: proxyUrl,
-				NODE_EXTRA_CA_CERTS: caPath,
-			},
-		},
+	// The MITM library writes directly to console. Isolate it in a worker rather
+	// than muting Pi's global stdout/stderr while other requests and tools run.
+	const captured = await runJsonCommand<ClaudeCodeTokenBundle>(
+		process.execPath, [CAPTURE_SCRIPT, "--capture-token", "--model", CAPTURE_ANTHROPIC_MODEL],
+		signal, CAPTURE_TIMEOUT_MS + 5_000, env,
 	);
-
-	let stdout = "";
-	let stderr = "";
-	child.stdout.on("data", (chunk) => {
-		stdout += String(chunk);
-	});
-	child.stderr.on("data", (chunk) => {
-		stderr += String(chunk);
-	});
-
-	const exitPromise = (async () => {
-		const [code, signal] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
-		if (captured) return captured;
-		throw new Error(
-			`Claude Code exited before token capture (${code ?? "unknown"}${signal ? `, ${signal}` : ""}). ${stderr || stdout}`,
-		);
-	})();
-
-	let timeoutHandle: ReturnType<typeof setTimeout>;
-	const timeoutPromise = new Promise<ClaudeCodeTokenBundle>((_, reject) => {
-		timeoutHandle = setTimeout(() => {
-			reject(new Error(`Timed out waiting for Claude Code token capture after ${CAPTURE_TIMEOUT_MS}ms.`));
-		}, CAPTURE_TIMEOUT_MS);
-	});
-
-	const originalConsoleLog = console.log;
-	const originalConsoleWarn = console.warn;
-	const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-	const originalStderrWrite = process.stderr.write.bind(process.stderr);
-	console.log = () => {};
-	console.warn = () => {};
-	(process.stdout.write as unknown as (...args: any[]) => boolean) = (() => true) as any;
-	(process.stderr.write as unknown as (...args: any[]) => boolean) = (() => true) as any;
-	try {
-		const bundle = await Promise.race([bundlePromise, exitPromise, timeoutPromise]);
-		return {
-			...bundle,
-			anthropicBeta: normalizeAnthropicBeta(bundle.anthropicBeta),
-			userAgent: normalizeClaudeCodeUserAgent(bundle.userAgent),
-			xApp: bundle.xApp || DEFAULT_X_APP,
-		};
-	} finally {
-		clearTimeout(timeoutHandle!);
-		try {
-			if (child.exitCode == null && child.signalCode == null) {
-				child.kill("SIGTERM");
-				const exited = await Promise.race([
-					once(child, "exit").then(() => true),
-					new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1000)),
-				]);
-				if (!exited) {
-					child.kill("SIGKILL");
-					await Promise.race([
-						once(child, "exit").catch(() => undefined),
-						new Promise((resolve) => setTimeout(resolve, 1000)),
-					]);
-				}
-			}
-		} catch {}
-		await closeMitmProxy(proxy);
-		await fsp.rm(caDir, { recursive: true, force: true });
-		console.log = originalConsoleLog;
-		console.warn = originalConsoleWarn;
-		(process.stdout.write as unknown as (...args: any[]) => boolean) = originalStdoutWrite as any;
-		(process.stderr.write as unknown as (...args: any[]) => boolean) = originalStderrWrite as any;
+	if (typeof captured.accessToken !== "string" || !captured.accessToken.startsWith("sk-ant-oat")) {
+		throw new Error("Claude Code did not return an OAuth access token.");
 	}
+	return {
+		...captured,
+		capturedAt: Date.now(),
+		expiresAt: Date.now() + TOKEN_TTL_MS,
+		anthropicBeta: normalizeAnthropicBeta(captured.anthropicBeta),
+		userAgent: normalizeClaudeCodeUserAgent(captured.userAgent),
+		xApp: captured.xApp || DEFAULT_X_APP,
+	};
 }
 
-async function getTokenBundle(forceRefresh = false): Promise<ClaudeCodeTokenBundle> {
+async function getTokenBundle(forceRefresh = false, signal?: AbortSignal, env: NodeJS.ProcessEnv = process.env): Promise<ClaudeCodeTokenBundle> {
+	signal?.throwIfAborted();
+	const authFingerprint = env.CLAUDE_CODE_OAUTH_TOKEN
+		? createHash("sha256").update(env.CLAUDE_CODE_OAUTH_TOKEN).digest("hex") : undefined;
 	if (!forceRefresh) {
 		const cached = await readTokenCache();
-		if (isCacheFresh(cached)) {
+		signal?.throwIfAborted();
+		if (isCacheFresh(cached) && cached.authFingerprint === authFingerprint) {
 			return {
 				...cached,
 				anthropicBeta: normalizeAnthropicBeta(cached.anthropicBeta),
@@ -673,29 +521,44 @@ async function getTokenBundle(forceRefresh = false): Promise<ClaudeCodeTokenBund
 		}
 	}
 
-	if (inflightTokenRefresh) {
-		return inflightTokenRefresh;
+	if (inflightTokenRefresh && inflightTokenRefresh.authFingerprint !== authFingerprint) {
+		await withAbort(inflightTokenRefresh.promise.catch(() => undefined), signal);
+		return getTokenBundle(forceRefresh, signal, env);
 	}
-
-	inflightTokenRefresh = (async () => {
-		const bundle = await captureFreshTokenBundle();
-		await writeTokenCache(bundle);
-		return bundle;
-	})();
-
+	if (!inflightTokenRefresh) {
+		const controller = new AbortController();
+		const refresh = { controller, waiters: 0, authFingerprint, promise: Promise.resolve({} as ClaudeCodeTokenBundle) };
+		inflightTokenRefresh = refresh;
+		refresh.promise = (async () => {
+			try {
+				const bundle = { ...await captureFreshTokenBundle(controller.signal, env), authFingerprint };
+				controller.signal.throwIfAborted();
+				await writeTokenCache(bundle);
+				return bundle;
+			} finally {
+				if (inflightTokenRefresh === refresh) inflightTokenRefresh = null;
+			}
+		})();
+	}
+	const refresh = inflightTokenRefresh;
+	refresh.waiters++;
 	try {
-		return await inflightTokenRefresh;
+		return await withAbort(refresh.promise, signal);
 	} finally {
-		inflightTokenRefresh = null;
+		// Cancelling a cache warmer must not abort a foreground request's refresh.
+		if (--refresh.waiters === 0 && inflightTokenRefresh === refresh) {
+			inflightTokenRefresh = null;
+			refresh.controller.abort();
+		}
 	}
 }
 
-function providerHeaders(bundle: ClaudeCodeTokenBundle, modelId: string): Record<string, string> {
+function providerHeaders(bundle: ClaudeCodeTokenBundle, model: Model<Api>, sessionId: string, extraBetas?: string): Record<string, string> {
 	return {
-		"anthropic-beta": betaHeaderForModel(modelId),
+		"anthropic-beta": betaHeaderForModel(model, extraBetas),
 		"user-agent": normalizeClaudeCodeUserAgent(bundle.userAgent),
 		"x-app": bundle.xApp || DEFAULT_X_APP,
-		"x-claude-code-session-id": randomUUID(),
+		"x-claude-code-session-id": sessionId,
 		"x-client-request-id": randomUUID(),
 	};
 }
@@ -705,10 +568,7 @@ function toAnthropicModel(model: Model<Api>): Model<"anthropic-messages"> {
 		...model,
 		api: "anthropic-messages",
 		id: ANTHROPIC_ID_BY_MODEL_ID.get(model.id) ?? model.id,
-		// pi-ai 0.77 reads compat.forceAdaptiveThinking from the model to decide
-		// whether to send `thinking.type: "adaptive"` + `output_config.effort`.
-		// Every model this provider exposes uses the adaptive thinking format, so
-		// force it regardless of the remapped id.
+		// All exposed models use adaptive rather than budget-based thinking.
 		compat: {
 			...((model as Model<"anthropic-messages">).compat ?? {}),
 			forceAdaptiveThinking: true,
@@ -719,29 +579,47 @@ function toAnthropicModel(model: Model<Api>): Model<"anthropic-messages"> {
 async function pipeAttempt(
 	outer: AssistantMessageEventStream,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 	attempt: number,
+	loadToken: typeof getTokenBundle,
 ): Promise<"done" | "retry"> {
-	const bundle = await getTokenBundle(attempt > 0);
-	const inner = streamSimpleAnthropic(toAnthropicModel(model), context, {
+	options?.signal?.throwIfAborted();
+	const bundle = await loadToken(attempt > 0, options?.signal, { ...process.env, ...options?.env });
+	options?.signal?.throwIfAborted();
+	const sessionId = options?.sessionId ?? DEFAULT_SESSION_ID;
+	const transcript: TranscriptContext = {
+		...context,
+		messages: context.messages.map((message) => message.role === "assistant" && message.provider === model.provider
+			? { ...message, api: "anthropic-messages", model: ANTHROPIC_ID_BY_MODEL_ID.get(message.model) ?? message.model }
+			: message),
+	};
+	const headers = { ...options?.headers, ...providerHeaders(bundle, model, sessionId, getHeader(options?.headers, "anthropic-beta")) };
+	// Branch summaries omit reasoning entirely. Always-on models still need
+	// adaptive thinking; low effort keeps these bounded, one-off requests cheap.
+	const reasoning = options?.reasoning ?? (model.thinkingLevelMap?.off === null ? "low" : undefined);
+	const inner = anthropicMessagesApi().streamSimple(toAnthropicModel(model), transcript, {
 		...options,
+		reasoning,
 		maxTokens: options?.maxTokens ?? DEFAULT_MAX_TOKENS,
 		apiKey: bundle.accessToken,
-		headers: {
-			...providerHeaders(bundle, model.id),
-			...(options?.headers || {}),
+		headers,
+		onPayload: async (payload) => {
+			const rewritten = rewriteClaudeCodePayload(payload, sessionId);
+			return await options?.onPayload?.(rewritten, model) ?? rewritten;
 		},
-		onPayload: async (payload, payloadModel) => {
-			const callerPayload = await options?.onPayload?.(payload, payloadModel);
-			return rewriteClaudeCodePayload(callerPayload ?? payload);
-		},
+		onResponse: options?.onResponse ? (response) => options.onResponse!(response, model) : undefined,
+		onProviderStreamEvent: options?.onProviderStreamEvent ? (event) => options.onProviderStreamEvent!(event, model) : undefined,
 	});
 
 	let bufferedStart: AssistantMessageEvent | null = null;
 	let emittedVisibleEvent = false;
 
 	for await (const event of inner) {
+		// Persist Pi-facing IDs so tree navigation, resuming and model attribution
+		// can resolve the response. Translate them back only for signed replay.
+		const message = "partial" in event ? event.partial : event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
+		if (message) { message.api = model.api; message.model = model.id; }
 		if (!emittedVisibleEvent) {
 			if (event.type === "start") {
 				bufferedStart = event;
@@ -749,7 +627,7 @@ async function pipeAttempt(
 			}
 
 			if (event.type === "error" && isAuthenticationError(event.error.errorMessage) && attempt === 0) {
-				await clearTokenCache();
+				options?.signal?.throwIfAborted();
 				return "retry";
 			}
 
@@ -775,15 +653,16 @@ async function pipeAttempt(
 
 function streamClaudeCodeProvider(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
+	loadToken = getTokenBundle,
 ): AssistantMessageEventStream {
 	const outer = createAssistantMessageEventStream();
 
 	void (async () => {
 		try {
 			for (let attempt = 0; attempt < 2; attempt++) {
-				const outcome = await pipeAttempt(outer, model, context, options, attempt);
+				const outcome = await pipeAttempt(outer, model, context, options, attempt, loadToken);
 				if (outcome === "done") return;
 			}
 		} catch (error) {
@@ -821,16 +700,26 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 			contextWindow: model.contextWindow,
 			maxTokens: model.maxTokens,
 			thinkingLevelMap: model.thinkingLevelMap,
+			compat: model.compat,
+			promptCache: model.promptCache,
 		})),
 		streamSimple: streamClaudeCodeProvider,
 	});
 
 	pi.registerCommand("claude-code-auth", {
-		description: "Check or refresh the cached Claude Code access token",
+		description: "Check, refresh or clear the cached Claude Code access token",
 		handler: async (args, ctx) => {
+			if (args.trim() === "clear") {
+				const refresh = inflightTokenRefresh;
+				refresh?.controller.abort();
+				await refresh?.promise.catch(() => {});
+				await clearTokenCache();
+				ctx.ui.notify("Cleared Claude Code token cache.", "info");
+				return;
+			}
 			const refresh = args.trim() === "refresh";
-			const status = await runClaudeAuthStatus().catch(() => ({} as ClaudeAuthStatus));
 			if (!refresh) {
+				const status = await runClaudeAuthStatus().catch(() => ({} as ClaudeAuthStatus));
 				const cached = await readTokenCache();
 				ctx.ui.notify(
 					`Claude Code auth: ${status.loggedIn ? `${status.authMethod ?? "unknown"}/${status.subscriptionType ?? "unknown"}` : "not logged in"}; ${formatCacheAge(cached)}`,
@@ -853,7 +742,6 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 }
 
 export {
-	CAPTURE_PROMPT,
 	CLAUDE_CODE_MODELS,
 	CLAUDE_CODE_PROVIDER,
 	DEFAULT_MODEL_ID,
@@ -861,5 +749,7 @@ export {
 	getTokenBundle,
 	isAuthenticationError,
 	normalizeClaudeCodeUserAgent,
+	rewriteClaudeCodePayload,
+	runJsonCommand,
 	streamClaudeCodeProvider,
 };
