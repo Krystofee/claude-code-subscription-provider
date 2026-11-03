@@ -8,7 +8,7 @@ import { normalizeContext, getSupportedThinkingLevels, type Model, type Api, typ
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession, generateSummaryWithUsage, generateBranchSummary, type ProviderConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, isAuthenticationError, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
+import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
 
 const token = { accessToken: "sk-ant-oat-AUDIT-FIXTURE-NOT-A-REAL-TOKEN", capturedAt: Date.now(), expiresAt: Date.now() + 3600000 };
 const loadToken = async () => token;
@@ -194,6 +194,68 @@ test("refreshes invalid tokens once before publishing any events", async () => {
 	assert.deepEqual(refreshes, [false, true]);
 	assert.equal(events.filter((e) => e === "start").length, 1);
 	assert.equal(events.filter((e) => e === "done").length, 1);
+});
+
+test("a token rejected after refresh tells the user how to log in from Pi", async () => {
+	const unauthorized = () => new Response(JSON.stringify({ error: { type: "authentication_error", message: "Invalid bearer token" } }), { status: 401, headers: { "content-type": "application/json" } });
+	const result = await streamClaudeCodeProvider(model(), context(), { fetch: fixtureFetch([], unauthorized) }, loadToken).result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage!, /Invalid bearer token.*\/claude-code-auth login/);
+});
+
+async function withFakeClaude(script: string, run: (env: NodeJS.ProcessEnv) => Promise<void>) {
+	const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "claude-login-test-"));
+	try {
+		await fsp.writeFile(path.join(directory, "claude"), `#!${process.execPath}\n${script}`, { mode: 0o700 });
+		await run({ ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`, TMPDIR: directory });
+	} finally { await fsp.rm(directory, { recursive: true, force: true }); }
+}
+
+test("logged-out and expired Claude Code logins point to /claude-code-auth login", async () => {
+	// Real `claude auth status` prints valid JSON but exits 1 when logged out.
+	await withFakeClaude(`console.log(JSON.stringify({ loggedIn: false, authMethod: 'none' })); process.exit(1);`, async (env) => {
+		await assert.rejects(captureFreshTokenBundle(undefined, env), /not logged in.*\/claude-code-auth login/);
+	});
+	// A dead refresh token still reports loggedIn; the probe exits before any request.
+	await withFakeClaude(`
+		if (process.argv.includes('status')) console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }));
+		else { console.error('Failed to authenticate: OAuth session expired and could not be refreshed'); process.exit(1); }
+	`, async (env) => {
+		await assert.rejects(captureFreshTokenBundle(undefined, env), /probably expired.*\/claude-code-auth login/);
+	});
+});
+
+test("login drives claude auth login through the browser callback or a pasted code", async () => {
+	const url = "https://claude.com/cai/oauth/authorize?code=true&state=fixture";
+	const fakeLogin = `
+		process.stdout.write('Opening browser to sign in…\\nIf the browser didn\\'t open, visit: \\x1b]8;;${url}\\x07${url}\\x1b]8;;\\x07\\nPaste code here if prompted > ');
+		if (process.env.FAKE_LOGIN === 'callback') setTimeout(() => process.exit(0), 100);
+		process.stdin.once('data', (line) => {
+			if (String(line).trim() === 'good#state') process.exit(0);
+			console.log('Login failed: Request failed with status code 400'); process.exit(1);
+		});
+	`;
+	const ui = (answer?: string) => {
+		const seen = { notified: "", dismissed: false };
+		return { seen, ui: {
+			notify: (message: string) => { seen.notified += message; },
+			input: (_title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => answer === "wait"
+				? new Promise<string | undefined>((resolve) => opts!.signal!.addEventListener("abort", () => { seen.dismissed = true; resolve(undefined); }))
+				: Promise.resolve(answer),
+		} };
+	};
+	await withFakeClaude(fakeLogin, async (env) => {
+		const pasted = ui("good#state");
+		await loginClaudeCode(pasted.ui, env);
+		assert.equal(pasted.seen.notified.split("\n").at(-1), url);
+
+		const callback = ui("wait");
+		await loginClaudeCode(callback.ui, { ...env, FAKE_LOGIN: "callback" });
+		assert.equal(callback.seen.dismissed, true);
+
+		await assert.rejects(loginClaudeCode(ui("bad#state").ui, env), /^Error: Login failed: Request failed with status code 400$/);
+		await assert.rejects(loginClaudeCode(ui(undefined).ui, env), /exited/);
+	});
 });
 
 test("a pre-aborted request does not load credentials or spawn an auth probe", async () => {

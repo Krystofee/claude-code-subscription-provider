@@ -16,7 +16,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 type ClaudeAuthStatus = {
 	loggedIn?: boolean;
@@ -147,6 +147,8 @@ const CAPTURE_ANTHROPIC_MODEL = ANTHROPIC_ID_BY_MODEL_ID.get(DEFAULT_MODEL_ID) ?
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
+const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const LOGIN_HINT = "Run `/claude-code-auth login` in Pi (or `claude auth login --claudeai` in a terminal), then retry.";
 const CACHE_FILE = path.join(
 	process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
 	"cache", "claude-code-subscription-provider.json",
@@ -392,15 +394,12 @@ function buildLoginHint(status?: ClaudeAuthStatus): string {
 	const statusSummary = status?.loggedIn
 		? `Claude Code authMethod=${status.authMethod ?? "unknown"}, subscription=${status.subscriptionType ?? "unknown"}`
 		: "Claude Code is not logged in.";
-	return [
-		statusSummary,
-		`Run \`claude auth login --claudeai\` in another terminal, finish the Claude subscription login, then retry.`,
-	].join(" ");
+	return `${statusSummary} ${LOGIN_HINT}`;
 }
 
 async function runJsonCommand<T>(
 	command: string, args: string[], signal?: AbortSignal, timeoutMs = 15_000,
-	env: NodeJS.ProcessEnv = process.env,
+	env: NodeJS.ProcessEnv = process.env, okExitCodes = [0],
 ): Promise<T> {
 	signal?.throwIfAborted();
 	return await new Promise((resolve, reject) => {
@@ -431,7 +430,7 @@ async function runJsonCommand<T>(
 			clearTimeout(killTimer);
 			signal?.removeEventListener("abort", onAbort);
 			if (stopped) return;
-			if (code !== 0) {
+			if (code === null || !okExitCodes.includes(code)) {
 				reject(new Error(`${command} failed (${code ?? "signal"}). Check Claude Code login and connectivity.`));
 				return;
 			}
@@ -442,7 +441,45 @@ async function runJsonCommand<T>(
 }
 
 async function runClaudeAuthStatus(signal?: AbortSignal, env?: NodeJS.ProcessEnv): Promise<ClaudeAuthStatus> {
-	return runJsonCommand("claude", ["auth", "status"], signal, 15_000, env);
+	// Logged-out status is still valid JSON, but `claude auth status` exits 1.
+	return runJsonCommand("claude", ["auth", "status"], signal, 15_000, env, [0, 1]);
+}
+
+async function loginClaudeCode(ui: Pick<ExtensionUIContext, "input" | "notify">, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+	// Claude Code opens the browser itself and finishes through its localhost
+	// callback; the pasted code is the fallback when that callback never arrives.
+	const child = spawn("claude", ["auth", "login", "--claudeai"], { stdio: ["pipe", "pipe", "pipe"], env });
+	const exited = new AbortController();
+	let output = "";
+	let prompted = false;
+	const onOutput = (chunk: Buffer) => {
+		output = (output + String(chunk)).slice(-16_000);
+		const url = output.match(/https:\/\/[^\s\x07\x1b]+/)?.[0];
+		if (prompted || !url) return;
+		prompted = true;
+		ui.notify(`Claude login opened in your browser. If it didn't open, visit:\n${url}`, "info");
+		void ui.input("Finish the Claude login in the browser, or paste the code it shows", "code#state", { signal: exited.signal })
+			.then((code) => {
+				if (exited.signal.aborted) return;
+				if (code?.trim()) child.stdin.write(`${code.trim()}\n`);
+				else child.kill("SIGTERM");
+			});
+	};
+	child.stdout.on("data", onOutput);
+	child.stderr.on("data", onOutput);
+	child.stdin.on("error", () => {});
+	const timer = setTimeout(() => child.kill("SIGTERM"), LOGIN_TIMEOUT_MS);
+	const code = await new Promise<number | null>((resolve, reject) => {
+		child.on("error", reject);
+		child.on("close", resolve);
+	}).finally(() => {
+		clearTimeout(timer);
+		exited.abort();
+	});
+	if (code !== 0) {
+		const reason = output.match(/Login failed[^\n]*/)?.[0] ?? `claude auth login exited (${code ?? "cancelled"})`;
+		throw new Error(reason.replace(/sk-ant-[\w-]+/g, "[REDACTED]"));
+	}
 }
 
 function createProviderError(model: Model<Api>, message: string, aborted = false): AssistantMessage {
@@ -490,7 +527,12 @@ async function captureFreshTokenBundle(signal?: AbortSignal, env?: NodeJS.Proces
 	const captured = await runJsonCommand<ClaudeCodeTokenBundle>(
 		process.execPath, [CAPTURE_SCRIPT, "--capture-token", "--model", CAPTURE_ANTHROPIC_MODEL],
 		signal, CAPTURE_TIMEOUT_MS + 5_000, env,
-	);
+	).catch((error) => {
+		if (signal?.aborted) throw error;
+		// `auth status` only checks stored credentials; an expired refresh token
+		// surfaces here, when Claude Code exits before sending any request.
+		throw new Error(`Claude Code could not make an authenticated request; its login has probably expired. ${LOGIN_HINT}`);
+	});
 	if (typeof captured.accessToken !== "string" || !captured.accessToken.startsWith("sk-ant-oat")) {
 		throw new Error("Claude Code did not return an OAuth access token.");
 	}
@@ -626,9 +668,12 @@ async function pipeAttempt(
 				continue;
 			}
 
-			if (event.type === "error" && isAuthenticationError(event.error.errorMessage) && attempt === 0) {
-				options?.signal?.throwIfAborted();
-				return "retry";
+			if (event.type === "error" && isAuthenticationError(event.error.errorMessage)) {
+				if (attempt === 0) {
+					options?.signal?.throwIfAborted();
+					return "retry";
+				}
+				event.error.errorMessage = `${event.error.errorMessage} ${LOGIN_HINT}`;
 			}
 
 			if (bufferedStart) outer.push(bufferedStart);
@@ -707,8 +752,19 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("claude-code-auth", {
-		description: "Check, refresh or clear the cached Claude Code access token",
+		description: "Log in to Claude Code, or check, refresh or clear the cached access token",
 		handler: async (args, ctx) => {
+			if (args.trim() === "login") {
+				try {
+					await loginClaudeCode(ctx.ui);
+					const bundle = await getTokenBundle(true);
+					const status = await runClaudeAuthStatus();
+					ctx.ui.notify(`Logged in to Claude Code (${status.authMethod ?? "unknown"}/${status.subscriptionType ?? "unknown"}); ${formatCacheAge(bundle)}.`, "info");
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
 			if (args.trim() === "clear") {
 				const refresh = inflightTokenRefresh;
 				refresh?.controller.abort();
@@ -748,6 +804,7 @@ export {
 	captureFreshTokenBundle,
 	getTokenBundle,
 	isAuthenticationError,
+	loginClaudeCode,
 	normalizeClaudeCodeUserAgent,
 	rewriteClaudeCodePayload,
 	runJsonCommand,

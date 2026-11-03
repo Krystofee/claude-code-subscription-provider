@@ -106,7 +106,7 @@ Co dělá:
 - auth status i capture mají timeout a podporují cancellation; souběžní čekající sdílejí refresh
 - respektuje `maxTokens`, `cacheRetention: "none"` i system instructions; session ID a billing prefix zůstávají stabilní v rámci session
 - nativní `/compact` i `/tree` se summary používají stejný provider; auxiliary request bez reasoning zůstává validní i na always-on-thinking modelech
-- když Claude Code není přihlášené, vypíše instrukci k `claude auth login --claudeai`
+- login jde přímo z pi: `/claude-code-auth login` spustí `claude auth login --claudeai`, otevře prohlížeč a případně si řekne o vložený kód; chyby přihlášení (odhlášeno, expirovaný refresh token, odmítnutý token) na tenhle příkaz odkazují
 
 Instalace user-level z repozitáře:
 
@@ -133,9 +133,10 @@ Pak v pi (vyber libovolný model ze sady):
 /model claude-code-subscription-provider/fable-5
 ```
 
-Volitelně lze zkontrolovat nebo refreshnout cache:
+Přihlášení, kontrola nebo refresh cache:
 
 ```text
+/claude-code-auth login
 /claude-code-auth
 /claude-code-auth refresh
 /claude-code-auth clear
