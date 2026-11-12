@@ -8,7 +8,7 @@ import { normalizeContext, getSupportedThinkingLevels, type Model, type Api, typ
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession, generateSummaryWithUsage, generateBranchSummary, type ProviderConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, formatRateLimitHeaders, formatUsageLimit, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
+import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, fetchUsageLimitsWithRefresh, formatUsageLimit, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
 
 const token = { accessToken: "sk-ant-oat-AUDIT-FIXTURE-NOT-A-REAL-TOKEN", capturedAt: Date.now(), expiresAt: Date.now() + 3600000 };
 const loadToken = async () => token;
@@ -401,23 +401,20 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	}
 });
 
-test("summarizes subscription rate limit headers for the footer and ignores malformed ones", () => {
-	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" }), "Claude 5h 22% · 7d 29%");
-	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-5h-utilization": "n/a", "anthropic-ratelimit-unified-7d-utilization": "0.29" }), "Claude 7d 29%");
-	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-status": "allowed" }), undefined);
-});
-
-test("footer shows usage only for this provider and clears when switching away", () => {
+test("footer shows usage only for this provider, skips malformed headers and clears when switching away", () => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
 	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
 	const statuses: Array<string | undefined> = [];
 	const ctx = (provider: string) => ({ model: { provider }, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } });
+	const respond = (provider: string, headers: Record<string, string>) => handlers.get("after_provider_response")!({ status: 200, headers }, ctx(provider));
 	const headers = { "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" };
-	handlers.get("after_provider_response")!({ status: 200, headers }, ctx("anthropic"));
-	handlers.get("after_provider_response")!({ status: 200, headers }, ctx(CLAUDE_CODE_PROVIDER));
+	respond("anthropic", headers);
+	respond(CLAUDE_CODE_PROVIDER, headers);
+	respond(CLAUDE_CODE_PROVIDER, { ...headers, "anthropic-ratelimit-unified-5h-utilization": "n/a" });
+	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-status": "allowed" });
 	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
 	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
-	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", undefined]);
+	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", "Claude 7d 29%", undefined]);
 });
 
 function usageResponse(limits: unknown[]): Response {
@@ -436,6 +433,7 @@ test("usage limits label per-model limits and skip entries whose shape changed",
 		return usageResponse([
 			{ kind: "session", percent: 22, resets_at: "2026-11-12T15:30:00Z", scope: null },
 			null,
+			{ kind: "weekly_all", percent: 29, resets_at: "2026-11-16T18:00:00Z" },
 			{ kind: "weekly_all", resets_at: "2026-11-16T18:00:00Z" },
 			{ kind: "weekly_scoped", percent: 10, resets_at: "2026-11-16T18:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
 			{ kind: "weekly_oauth_apps", percent: 0, resets_at: null },
@@ -443,9 +441,21 @@ test("usage limits label per-model limits and skip entries whose shape changed",
 	});
 	assert.deepEqual(usage.map((limit) => formatUsageLimit(limit, now)), [
 		"Session (5h): 22% used, resets in 3h 30m",
+		"Weekly: 29% used, resets in 4d 6h",
 		"Weekly Fable: 10% used, resets in 4d 6h",
-		"Weekly: 0% used",
+		"weekly_oauth_apps: 0% used",
 	]);
+});
+
+test("the usage command refreshes the token once on 401 but not on other failures", async () => {
+	for (const [status, refreshes] of [[401, [false, true]], [403, [false]]] as const) {
+		const loads: boolean[] = [];
+		const usage = fetchUsageLimitsWithRefresh(async (forceRefresh = false) => { loads.push(forceRefresh); return token; }, async () =>
+			loads.length === 1 ? new Response("{}", { status }) : usageResponse([{ kind: "session", percent: 1, resets_at: null }]));
+		if (status === 401) assert.equal((await usage).length, 1);
+		else await assert.rejects(usage, /failed \(403\)/);
+		assert.deepEqual(loads, refreshes);
+	}
 });
 
 test("a 429 names the exhausted subscription limit with the request's own token", async () => {

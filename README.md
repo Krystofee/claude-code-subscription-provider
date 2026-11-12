@@ -139,7 +139,7 @@ Pak v pi (vyber libovolný model ze sady):
 /model claude-code-subscription-provider/fable-5
 ```
 
-Přihlášení, kontrola nebo refresh cache:
+Přihlášení, využití limitů, kontrola nebo refresh cache:
 
 ```text
 /claude-code-auth login
