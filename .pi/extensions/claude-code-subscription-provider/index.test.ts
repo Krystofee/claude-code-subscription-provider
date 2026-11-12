@@ -401,7 +401,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	}
 });
 
-test("footer shows usage only for this provider and clears when switching away", () => {
+test("footer shows each available limit for this provider only and clears when switching away", () => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
 	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, registerTool: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
 	const statuses: Array<string | undefined> = [];
@@ -410,10 +410,11 @@ test("footer shows usage only for this provider and clears when switching away",
 	const headers = { "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" };
 	respond("anthropic", headers);
 	respond(CLAUDE_CODE_PROVIDER, headers);
+	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-7d-utilization": "0.31" });
 	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-status": "allowed" });
 	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
 	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
-	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", undefined]);
+	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", "Claude 7d 31%", undefined]);
 });
 
 function usageResponse(limits: unknown[]): Response {

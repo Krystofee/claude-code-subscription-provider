@@ -522,10 +522,11 @@ function formatResetIn(resetAt: number, now = Date.now()): string {
 }
 
 function formatRateLimitHeaders(headers: Record<string, string>): string | undefined {
-	const fiveHour = getHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
-	const sevenDay = getHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
-	if (fiveHour === undefined || sevenDay === undefined) return undefined;
-	return `Claude 5h ${Math.round(Number(fiveHour) * 100)}% · 7d ${Math.round(Number(sevenDay) * 100)}%`;
+	const windows = ["5h", "7d"].flatMap((window) => {
+		const utilization = getHeader(headers, `anthropic-ratelimit-unified-${window}-utilization`);
+		return utilization === undefined ? [] : [`${window} ${Math.round(Number(utilization) * 100)}%`];
+	});
+	return windows.length ? `Claude ${windows.join(" · ")}` : undefined;
 }
 
 function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
