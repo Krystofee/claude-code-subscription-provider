@@ -8,7 +8,7 @@ import { normalizeContext, getSupportedThinkingLevels, type Model, type Api, typ
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession, generateSummaryWithUsage, generateBranchSummary, type ProviderConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
+import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, formatRateLimitHeaders, formatUsageLimit, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
 
 const token = { accessToken: "sk-ant-oat-AUDIT-FIXTURE-NOT-A-REAL-TOKEN", capturedAt: Date.now(), expiresAt: Date.now() + 3600000 };
 const loadToken = async () => token;
@@ -373,7 +373,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	try {
 		const wire: Wire[] = [];
 		let config!: ProviderConfig;
-		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {} } as unknown as ExtensionAPI);
+		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {}, on: () => {} } as unknown as ExtensionAPI);
 		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
 		runtime.registerProvider(CLAUDE_CODE_PROVIDER, { ...config, streamSimple: (selected, input, options) => streamClaudeCodeProvider(selected, input, { ...options, fetch: fixtureFetch(wire) }, loadToken) });
 		await runtime.refresh({ allowNetwork: false });
@@ -399,4 +399,63 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 		session?.dispose();
 		await fsp.rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("summarizes subscription rate limit headers for the footer", () => {
+	const now = Date.UTC(2026, 10, 12, 12);
+	const headers = {
+		"anthropic-ratelimit-unified-status": "allowed",
+		"anthropic-ratelimit-unified-5h-utilization": "0.22",
+		"anthropic-ratelimit-unified-7d-utilization": "0.29",
+		"anthropic-ratelimit-unified-reset": String(now / 1000 + 2 * 3600 + 600),
+	};
+	assert.equal(formatRateLimitHeaders(headers, now), "Claude 5h 22% · 7d 29%");
+	assert.equal(
+		formatRateLimitHeaders({ ...headers, "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-5h-utilization": "1.0" }, now),
+		"Claude limit reached, resets in 2h 10m · 5h 100% · 7d 29%",
+	);
+	assert.equal(formatRateLimitHeaders({ "content-type": "application/json" }, now), undefined);
+});
+
+function usageResponse(limits: unknown[]): Response {
+	return new Response(JSON.stringify({ limits }), { headers: { "content-type": "application/json" } });
+}
+
+test("usage limits refresh a rejected token once and label per-model limits", async () => {
+	const now = Date.UTC(2026, 10, 12, 12);
+	const refreshes: boolean[] = [];
+	const usage = await fetchUsageLimits(undefined, async (forceRefresh = false) => { refreshes.push(forceRefresh); return token; }, async (url, init) => {
+		assert.equal(url, "https://api.anthropic.com/api/oauth/usage");
+		assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
+		if (refreshes.length === 1) return new Response("{}", { status: 401 });
+		return usageResponse([
+			{ kind: "session", percent: 22, resets_at: "2026-11-12T15:30:00Z", scope: null },
+			{ kind: "weekly_scoped", percent: 10, resets_at: "2026-11-16T18:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
+		]);
+	});
+	assert.deepEqual(refreshes, [false, true]);
+	assert.deepEqual(usage.map((limit) => formatUsageLimit(limit, now)), [
+		"Session (5h): 22% used, resets in 3h 30m",
+		"Weekly Fable: 10% used, resets in 4d 6h",
+	]);
+});
+
+test("a 429 names the exhausted subscription limit and keeps the original error", async () => {
+	const resetsAt = new Date(Date.now() + 90 * 60_000).toISOString();
+	const wire: Wire[] = [];
+	const stream = streamClaudeCodeProvider(model(), context(), {
+		fetch: async (url, init) => {
+			if (String(url).endsWith("/api/oauth/usage")) return usageResponse([
+				{ kind: "session", percent: 100, resets_at: resetsAt, scope: null },
+				{ kind: "weekly_all", percent: 40, resets_at: resetsAt, scope: null },
+			]);
+			return fixtureFetch(wire, () => new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } }))(url, init);
+		},
+	}, loadToken);
+	const result = await stream.result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage!, /Rate limited/);
+	assert.match(result.errorMessage!, /Session \(5h\): 100% used, resets in 1h 30m\.$/);
+	assert.doesNotMatch(result.errorMessage!, /Weekly/);
+	assert.equal(wire.length, 1);
 });

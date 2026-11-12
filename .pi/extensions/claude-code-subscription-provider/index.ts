@@ -38,6 +38,13 @@ type ClaudeCodeTokenBundle = {
 	authFingerprint?: string;
 };
 
+type ClaudeUsageLimit = {
+	kind: string;
+	percent: number;
+	resets_at: string | null;
+	scope?: { model?: { display_name?: string | null } | null } | null;
+};
+
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
 
 // Subscription context limits differ from the API catalog (notably Sonnet).
@@ -198,6 +205,9 @@ const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const MODEL_IDS_WITH_1M = new Set(
 	CLAUDE_CODE_MODELS.filter((model) => model.contextWindow >= 1_000_000).map((model) => model.id),
 );
+// Same endpoint as Claude Code's /usage; it reports per-model limits the response headers omit.
+const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const USAGE_STATUS_KEY = "claude-code-usage";
 const CLAUDE_CODE_SDK_SYSTEM_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const CLAUDE_CODE_CONTEXT_MANAGEMENT = {
 	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
@@ -499,6 +509,57 @@ async function loginClaudeCode(ui: Pick<ExtensionUIContext, "input" | "notify">,
 	}
 }
 
+function formatResetIn(resetAt: number, now = Date.now()): string {
+	const minutes = Math.max(0, Math.ceil((resetAt - now) / 60_000));
+	const days = Math.floor(minutes / 1440);
+	const hours = Math.floor((minutes % 1440) / 60);
+	if (days) return `${days}d ${hours}h`;
+	if (hours) return `${hours}h ${minutes % 60}m`;
+	return `${minutes}m`;
+}
+
+function formatRateLimitHeaders(headers: Record<string, string>, now = Date.now()): string | undefined {
+	const status = headers["anthropic-ratelimit-unified-status"];
+	if (!status) return undefined;
+	const parts = (["5h", "7d"] as const).flatMap((window) => {
+		const utilization = headers[`anthropic-ratelimit-unified-${window}-utilization`];
+		return utilization == null ? [] : [`${window} ${Math.round(Number(utilization) * 100)}%`];
+	});
+	if (status === "rejected") {
+		parts.unshift(`limit reached, resets in ${formatResetIn(Number(headers["anthropic-ratelimit-unified-reset"]) * 1000, now)}`);
+	}
+	return `Claude ${parts.join(" · ")}`;
+}
+
+function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
+	const label = limit.kind === "session" ? "Session (5h)" : limit.kind.startsWith("weekly") ? "Weekly" : limit.kind;
+	const model = limit.scope?.model?.display_name;
+	const reset = limit.resets_at ? `, resets in ${formatResetIn(Date.parse(limit.resets_at), now)}` : "";
+	return `${model ? `${label} ${model}` : label}: ${limit.percent}% used${reset}`;
+}
+
+async function fetchUsageLimits(
+	signal?: AbortSignal, loadToken = getTokenBundle, fetchImpl: typeof fetch = fetch,
+): Promise<ClaudeUsageLimit[]> {
+	const request = async (forceRefresh: boolean) => {
+		const bundle = await loadToken(forceRefresh, signal);
+		return fetchImpl(USAGE_URL, {
+			signal,
+			headers: {
+				authorization: `Bearer ${bundle.accessToken}`,
+				"anthropic-beta": "oauth-2025-04-20",
+				"user-agent": normalizeClaudeCodeUserAgent(bundle.userAgent),
+			},
+		});
+	};
+	let response = await request(false);
+	if (response.status === 401) response = await request(true);
+	if (!response.ok) throw new Error(`Claude usage request failed (${response.status}).`);
+	const body = await response.json() as { limits?: ClaudeUsageLimit[] };
+	if (!Array.isArray(body.limits)) throw new Error("Claude usage response has no limits.");
+	return body.limits;
+}
+
 function createProviderError(model: Model<Api>, message: string, aborted = false): AssistantMessage {
 	return {
 		role: "assistant",
@@ -693,6 +754,13 @@ async function pipeAttempt(
 				event.error.errorMessage = `${event.error.errorMessage} ${LOGIN_HINT}`;
 			}
 
+			if (event.type === "error" && /\b429\b|rate_limit_error/.test(event.error.errorMessage ?? "")) {
+				// The usage lookup only explains the 429; never let it replace the original error.
+				const limits = await fetchUsageLimits(options?.signal, loadToken, options?.fetch ?? fetch).catch(() => []);
+				const exhausted = limits.filter((limit) => limit.percent >= 100).map((limit) => formatUsageLimit(limit));
+				if (exhausted.length) event.error.errorMessage = `${event.error.errorMessage} ${exhausted.join("; ")}.`;
+			}
+
 			if (bufferedStart) outer.push(bufferedStart);
 			emittedVisibleEvent = true;
 		}
@@ -768,9 +836,28 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		streamSimple: streamClaudeCodeProvider,
 	});
 
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== CLAUDE_CODE_PROVIDER) return;
+		const status = formatRateLimitHeaders(event.headers);
+		if (status) ctx.ui.setStatus(USAGE_STATUS_KEY, status);
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		if (event.model.provider !== CLAUDE_CODE_PROVIDER) ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
+	});
+
 	pi.registerCommand("claude-code-auth", {
-		description: "Log in to Claude Code, or check, refresh or clear the cached access token",
+		description: "Log in to Claude Code, show subscription usage limits, or check, refresh or clear the cached access token",
 		handler: async (args, ctx) => {
+			if (args.trim() === "usage") {
+				try {
+					const limits = await fetchUsageLimits();
+					ctx.ui.notify(limits.map((limit) => formatUsageLimit(limit)).join("\n"), "info");
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
 			if (args.trim() === "login") {
 				try {
 					await loginClaudeCode(ctx.ui);
@@ -819,6 +906,9 @@ export {
 	CLAUDE_CODE_PROVIDER,
 	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
+	fetchUsageLimits,
+	formatRateLimitHeaders,
+	formatUsageLimit,
 	getTokenBundle,
 	isAuthenticationError,
 	loginClaudeCode,
