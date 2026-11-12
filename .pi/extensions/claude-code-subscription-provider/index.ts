@@ -538,7 +538,7 @@ function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
 
 async function fetchUsageLimits(
 	bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch,
-	refreshToken?: () => Promise<ClaudeCodeTokenBundle>,
+	loadFreshToken?: () => Promise<ClaudeCodeTokenBundle>,
 ): Promise<ClaudeUsageLimit[]> {
 	const request = (token: ClaudeCodeTokenBundle) => {
 		const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
@@ -547,10 +547,10 @@ async function fetchUsageLimits(
 			headers: { authorization: `Bearer ${token.accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
 		});
 	};
-	const cachedTokenResponse = await request(bundle);
-	const refresh = cachedTokenResponse.status === 401 && refreshToken;
-	if (refresh) await cachedTokenResponse.body?.cancel();
-	const response = refresh ? await request(await refresh()) : cachedTokenResponse;
+	const firstResponse = await request(bundle);
+	const shouldRetryWithFreshToken = firstResponse.status === 401 && loadFreshToken !== undefined;
+	if (shouldRetryWithFreshToken) await firstResponse.body?.cancel();
+	const response = shouldRetryWithFreshToken ? await request(await loadFreshToken()) : firstResponse;
 	if (!response.ok) {
 		await response.body?.cancel();
 		throw new Error(`Claude usage request failed (${response.status}).`);
