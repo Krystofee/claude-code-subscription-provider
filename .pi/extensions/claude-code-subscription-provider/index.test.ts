@@ -8,8 +8,9 @@ import { normalizeContext, getSupportedThinkingLevels, type Model, type Api, typ
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession, generateSummaryWithUsage, generateBranchSummary, type ProviderConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
+import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, formatUsageLimits, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
 
+process.env.TZ = "UTC";
 const token = { accessToken: "sk-ant-oat-AUDIT-FIXTURE-NOT-A-REAL-TOKEN", capturedAt: Date.now(), expiresAt: Date.now() + 3600000 };
 const loadToken = async () => token;
 type Wire = { body: Record<string, any>; headers: Headers };
@@ -373,7 +374,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	try {
 		const wire: Wire[] = [];
 		let config!: ProviderConfig;
-		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {} } as unknown as ExtensionAPI);
+		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {}, registerTool: () => {}, on: () => {} } as unknown as ExtensionAPI);
 		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
 		runtime.registerProvider(CLAUDE_CODE_PROVIDER, { ...config, streamSimple: (selected, input, options) => streamClaudeCodeProvider(selected, input, { ...options, fetch: fixtureFetch(wire) }, loadToken) });
 		await runtime.refresh({ allowNetwork: false });
@@ -399,4 +400,102 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 		session?.dispose();
 		await fsp.rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("footer shows each available limit for this provider only and clears when switching away", () => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, registerTool: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
+	const statuses: Array<string | undefined> = [];
+	const ctx = (provider: string) => ({ model: { provider }, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } });
+	const respond = (provider: string, headers: Record<string, string>) => handlers.get("after_provider_response")!({ status: 200, headers }, ctx(provider));
+	const headers = { "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-5h-reset": "1794509400", "anthropic-ratelimit-unified-7d-utilization": "0.29" };
+	respond("anthropic", headers);
+	respond(CLAUDE_CODE_PROVIDER, headers);
+	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-7d-utilization": "0.31" });
+	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-status": "allowed" });
+	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
+	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
+	assert.deepEqual(statuses, ["Claude 5h: 22% (resets 18:50) · 7d: 29%", "Claude 7d: 31%", undefined]);
+});
+
+function usageResponse(limits: unknown[]): Response {
+	return new Response(JSON.stringify({ limits }), { headers: { "content-type": "application/json" } });
+}
+
+function rateLimited(): Response {
+	return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } });
+}
+
+test("usage limits render as an aligned table with per-model labels", async () => {
+	const now = Date.UTC(2026, 10, 12, 12);
+	const usage = await fetchUsageLimits(token, undefined, async (url, init) => {
+		assert.equal(url, "https://api.anthropic.com/api/oauth/usage");
+		assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
+		return usageResponse([
+			{ kind: "session", percent: 22, resets_at: "2026-11-12T15:30:00Z", scope: null },
+			{ kind: "weekly_all", percent: 29, resets_at: "2026-11-16T18:00:00Z", scope: null },
+			{ kind: "weekly_scoped", percent: 10, resets_at: "2026-11-16T18:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
+			{ kind: "weekly_oauth_apps", percent: 0, resets_at: null, scope: null },
+		]);
+	});
+	assert.equal(formatUsageLimits(usage, now), [
+		"Session (5h)        22% used   resets in 3h 30m",
+		"Weekly              29% used   resets in 4d 6h",
+		"Weekly (Fable)      10% used   resets in 4d 6h",
+		"weekly_oauth_apps    0% used",
+	].join("\n"));
+});
+
+test("a 429 names the exhausted subscription limits with the request's own token", async () => {
+	const resetsAt = new Date(Date.now() + 90 * 60_000).toISOString();
+	const weeklyResetsAt = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+	const wire: Wire[] = [];
+	let loads = 0;
+	const stream = streamClaudeCodeProvider(model(), context(), {
+		fetch: async (url, init) => {
+			if (String(url).endsWith("/api/oauth/usage")) {
+				assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
+				return usageResponse([
+					{ kind: "session", percent: 100, resets_at: resetsAt, scope: null },
+					{ kind: "weekly_all", percent: 40, resets_at: weeklyResetsAt, scope: null },
+					{ kind: "weekly_scoped", percent: 100, resets_at: weeklyResetsAt, scope: { model: { display_name: "Fable" } } },
+				]);
+			}
+			return fixtureFetch(wire, rateLimited)(url, init);
+		},
+	}, async () => { loads++; return token; });
+	const result = await stream.result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage!, /Rate limited/);
+	assert.match(result.errorMessage!, /Rate limited.* Limit reached: Session \(5h\), resets in 1h 30m \(\d\d:\d\d\); Weekly \(Fable\), resets in 3d 0h \([A-Z][a-z]{2} \d\d:\d\d\)\.$/);
+	assert.equal(wire.length, 1);
+	assert.equal(loads, 1);
+});
+
+test("a failed usage lookup keeps the original 429 and never refreshes the token", async () => {
+	for (const usage of [() => new Response("{}", { status: 401 }), () => new Response("not json", { status: 200 })]) {
+		let loads = 0;
+		const stream = streamClaudeCodeProvider(model(), context(), {
+			fetch: async (url) => String(url).endsWith("/api/oauth/usage") ? usage() : rateLimited(),
+		}, async () => { loads++; return token; });
+		const result = await stream.result();
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage!, /Rate limited/);
+		assert.doesNotMatch(result.errorMessage!, /Limit reached|Cannot read|usage/);
+		assert.equal(loads, 1);
+	}
+});
+
+test("cancelling during the 429 usage lookup ends the request as aborted", async () => {
+	const controller = new AbortController();
+	const stream = streamClaudeCodeProvider(model(), context(), {
+		signal: controller.signal,
+		fetch: async (url, init) => {
+			if (!String(url).endsWith("/api/oauth/usage")) return rateLimited();
+			controller.abort();
+			assert.equal(init!.signal!.aborted, true);
+			throw init!.signal!.reason;
+		},
+	}, loadToken);
+	assert.equal((await stream.result()).stopReason, "aborted");
 });

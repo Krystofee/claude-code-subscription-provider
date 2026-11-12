@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 import {
 	createAssistantMessageEventStream,
 	anthropicMessagesApi,
@@ -36,6 +37,13 @@ type ClaudeCodeTokenBundle = {
 	userAgent?: string;
 	xApp?: string;
 	authFingerprint?: string;
+};
+
+type ClaudeUsageLimit = {
+	kind: string;
+	percent: number;
+	resets_at: string | null;
+	scope: { model: { display_name: string | null } | null } | null;
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
@@ -166,6 +174,11 @@ const TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 const CAPTURE_TIMEOUT_MS = 90 * 1000;
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const USAGE_TIMEOUT_MS = 10 * 1000;
+// Same endpoint as Claude Code's /usage; it reports per-model limits the response headers omit.
+const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const USAGE_STATUS_KEY = "claude-code-usage";
+const USAGE_LIMIT_LABELS = new Map([["session", "Session (5h)"], ["weekly_all", "Weekly"], ["weekly_scoped", "Weekly"]]);
 const LOGIN_HINT = "Run `/claude-code-auth login` in Pi (or `claude auth login --claudeai` in a terminal), then retry.";
 const CACHE_FILE = path.join(
 	process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
@@ -499,6 +512,71 @@ async function loginClaudeCode(ui: Pick<ExtensionUIContext, "input" | "notify">,
 	}
 }
 
+function formatResetIn(resetAt: number, now = Date.now()): string {
+	const minutes = Math.max(0, Math.ceil((resetAt - now) / 60_000));
+	const days = Math.floor(minutes / 1440);
+	const hours = Math.floor((minutes % 1440) / 60);
+	if (days) return `${days}d ${hours}h`;
+	if (hours) return `${hours}h ${minutes % 60}m`;
+	return `${minutes}m`;
+}
+
+function formatTimeOfDay(at: number, now = Date.now()): string {
+	const date = new Date(at);
+	const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+	return at - now < 24 * 60 * 60 * 1000 ? time : `${date.toLocaleDateString("en-US", { weekday: "short" })} ${time}`;
+}
+
+function formatRateLimitHeaders(headers: Record<string, string>): string | undefined {
+	const parts: string[] = [];
+	const fiveHour = getHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
+	if (fiveHour !== undefined) {
+		const resetAt = Number(getHeader(headers, "anthropic-ratelimit-unified-5h-reset")) * 1000;
+		parts.push(`5h: ${Math.round(Number(fiveHour) * 100)}% (resets ${formatTimeOfDay(resetAt)})`);
+	}
+	const sevenDay = getHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
+	if (sevenDay !== undefined) parts.push(`7d: ${Math.round(Number(sevenDay) * 100)}%`);
+	return parts.length ? `Claude ${parts.join(" · ")}` : undefined;
+}
+
+function usageLimitLabel(limit: ClaudeUsageLimit): string {
+	const label = USAGE_LIMIT_LABELS.get(limit.kind) ?? limit.kind;
+	const model = limit.scope?.model?.display_name;
+	return model ? `${label} (${model})` : label;
+}
+
+function formatUsageLimits(limits: ClaudeUsageLimit[], now = Date.now()): string {
+	const rows = limits.map((limit) => [
+		usageLimitLabel(limit),
+		`${limit.percent}% used`,
+		limit.resets_at ? `resets in ${formatResetIn(Date.parse(limit.resets_at), now)}` : "",
+	]);
+	const labelWidth = Math.max(...rows.map(([label]) => label.length));
+	const usedWidth = Math.max(...rows.map(([, used]) => used.length));
+	return rows.map(([label, used, reset]) => `${label.padEnd(labelWidth)}   ${used.padStart(usedWidth)}   ${reset}`.trimEnd()).join("\n");
+}
+
+async function fetchUsageLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<ClaudeUsageLimit[]> {
+	const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
+	const response = await fetchImpl(USAGE_URL, {
+		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+		headers: { authorization: `Bearer ${bundle.accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
+	});
+	if (!response.ok) throw new Error(`Claude usage request failed (${response.status}).`);
+	const body = await response.json() as { limits: ClaudeUsageLimit[] };
+	return body.limits;
+}
+
+async function describeExhaustedLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl?: typeof fetch): Promise<string> {
+	const limits = await fetchUsageLimits(bundle, signal, fetchImpl);
+	const exhausted = limits.filter((limit) => limit.percent >= 100).map((limit) => {
+		if (!limit.resets_at) return usageLimitLabel(limit);
+		const resetAt = Date.parse(limit.resets_at);
+		return `${usageLimitLabel(limit)}, resets in ${formatResetIn(resetAt)} (${formatTimeOfDay(resetAt)})`;
+	});
+	return exhausted.length ? `Limit reached: ${exhausted.join("; ")}.` : "";
+}
+
 function createProviderError(model: Model<Api>, message: string, aborted = false): AssistantMessage {
 	return {
 		role: "assistant",
@@ -612,6 +690,11 @@ async function getTokenBundle(forceRefresh = false, signal?: AbortSignal, env: N
 	}
 }
 
+async function describeUsageLimits(signal?: AbortSignal): Promise<string> {
+	const limits = await fetchUsageLimits(await getTokenBundle(false, signal), signal);
+	return formatUsageLimits(limits);
+}
+
 function providerHeaders(bundle: ClaudeCodeTokenBundle, model: Model<Api>, sessionId: string, extraBetas?: string): Record<string, string> {
 	return {
 		"anthropic-beta": betaHeaderForModel(model, extraBetas),
@@ -693,6 +776,13 @@ async function pipeAttempt(
 				event.error.errorMessage = `${event.error.errorMessage} ${LOGIN_HINT}`;
 			}
 
+			if (event.type === "error" && /\b429\b|rate_limit_error/.test(event.error.errorMessage ?? "")) {
+				// The usage lookup only explains the 429; never let it replace the original error.
+				const exhausted = await describeExhaustedLimits(bundle, options?.signal, options?.fetch).catch(() => "");
+				options?.signal?.throwIfAborted();
+				if (exhausted) event.error.errorMessage = `${event.error.errorMessage} ${exhausted}`;
+			}
+
 			if (bufferedStart) outer.push(bufferedStart);
 			emittedVisibleEvent = true;
 		}
@@ -768,8 +858,30 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		streamSimple: streamClaudeCodeProvider,
 	});
 
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== CLAUDE_CODE_PROVIDER) return;
+		const status = formatRateLimitHeaders(event.headers);
+		if (status) ctx.ui.setStatus(USAGE_STATUS_KEY, status);
+	});
+
+	pi.on("model_select", (event, ctx) => {
+		if (event.model.provider !== CLAUDE_CODE_PROVIDER) ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
+	});
+
+	pi.registerTool({
+		name: "claude_subscription_usage",
+		label: "Claude subscription usage",
+		description: "Show how much of the Claude subscription rate limits is used and when each limit resets: the 5-hour session, the weekly limit and per-model weekly limits.",
+		promptSnippet: "Check how much Claude subscription rate limit remains",
+		promptGuidelines: ["Use claude_subscription_usage before starting long or parallel work on Claude subscription models, such as several subagents, to check how much rate limit remains."],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal) {
+			return { content: [{ type: "text", text: await describeUsageLimits(signal) }], details: undefined };
+		},
+	});
+
 	pi.registerCommand("claude-code-auth", {
-		description: "Log in to Claude Code, or check, refresh or clear the cached access token",
+		description: "Log in to Claude Code, show subscription usage limits, or check, refresh or clear the cached access token",
 		handler: async (args, ctx) => {
 			if (args.trim() === "login") {
 				try {
@@ -788,6 +900,14 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 				await refresh?.promise.catch(() => {});
 				await clearTokenCache();
 				ctx.ui.notify("Cleared Claude Code token cache.", "info");
+				return;
+			}
+			if (args.trim() === "usage") {
+				try {
+					ctx.ui.notify(await describeUsageLimits(), "info");
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
 				return;
 			}
 			const refresh = args.trim() === "refresh";
@@ -819,6 +939,8 @@ export {
 	CLAUDE_CODE_PROVIDER,
 	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
+	fetchUsageLimits,
+	formatUsageLimits,
 	getTokenBundle,
 	isAuthenticationError,
 	loginClaudeCode,
