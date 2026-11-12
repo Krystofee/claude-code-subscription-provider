@@ -447,18 +447,22 @@ test("usage limits label per-model limits and skip entries whose shape changed",
 	]);
 });
 
-test("usage lookups refresh the token once on 401 but not on other failures", async () => {
+test("usage lookups retry with a fresh token on 401 but not on other failures", async () => {
 	const refreshed = { ...token, accessToken: "sk-ant-oat-REFRESHED-FIXTURE" };
-	for (const [status, expectedTokens] of [[401, [token, refreshed]], [403, [token]]] as const) {
+	const lookUpAfter = (status: number) => {
 		const sentTokens: string[] = [];
 		const usage = fetchUsageLimits(token, undefined, async (_url, init) => {
 			sentTokens.push(new Headers(init?.headers).get("authorization")!);
 			return sentTokens.length === 1 ? new Response("{}", { status }) : usageResponse([{ kind: "session", percent: 1, resets_at: null }]);
 		}, async () => refreshed);
-		if (status === 401) assert.equal((await usage).length, 1);
-		else await assert.rejects(usage, /failed \(403\)/);
-		assert.deepEqual(sentTokens, expectedTokens.map((bundle) => `Bearer ${bundle.accessToken}`));
-	}
+		return { sentTokens, usage };
+	};
+	const unauthorized = lookUpAfter(401);
+	assert.equal((await unauthorized.usage).length, 1);
+	assert.deepEqual(unauthorized.sentTokens, [`Bearer ${token.accessToken}`, `Bearer ${refreshed.accessToken}`]);
+	const forbidden = lookUpAfter(403);
+	await assert.rejects(forbidden.usage, /failed \(403\)/);
+	assert.deepEqual(forbidden.sentTokens, [`Bearer ${token.accessToken}`]);
 });
 
 test("a 429 names the exhausted subscription limit with the request's own token", async () => {

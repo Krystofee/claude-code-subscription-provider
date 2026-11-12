@@ -42,7 +42,7 @@ type ClaudeUsageLimit = {
 	kind: string;
 	percent: number;
 	resets_at: string | null;
-	scope?: { model?: { display_name?: string | null } | null } | null;
+	scope: { model: { display_name: string | null } | null } | null;
 };
 
 const CLAUDE_CODE_PROVIDER = "claude-code-subscription-provider";
@@ -177,7 +177,7 @@ const USAGE_TIMEOUT_MS = 10 * 1000;
 // Same endpoint as Claude Code's /usage; it reports per-model limits the response headers omit.
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const USAGE_STATUS_KEY = "claude-code-usage";
-const USAGE_LIMIT_LABELS: Record<string, string> = { session: "Session (5h)", weekly_all: "Weekly", weekly_scoped: "Weekly" };
+const USAGE_LIMIT_LABELS = new Map([["session", "Session (5h)"], ["weekly_all", "Weekly"], ["weekly_scoped", "Weekly"]]);
 const LOGIN_HINT = "Run `/claude-code-auth login` in Pi (or `claude auth login --claudeai` in a terminal), then retry.";
 const CACHE_FILE = path.join(
 	process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
@@ -529,7 +529,7 @@ function formatRateLimitHeaders(headers: Record<string, string>): string | undef
 }
 
 function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
-	const label = USAGE_LIMIT_LABELS[limit.kind] ?? limit.kind;
+	const label = USAGE_LIMIT_LABELS.get(limit.kind) ?? limit.kind;
 	const model = limit.scope?.model?.display_name;
 	const resetAt = Date.parse(limit.resets_at ?? "");
 	const reset = Number.isFinite(resetAt) ? `, resets in ${formatResetIn(resetAt, now)}` : "";
@@ -555,7 +555,8 @@ async function fetchUsageLimits(
 		await response.body?.cancel();
 		throw new Error(`Claude usage request failed (${response.status}).`);
 	}
-	const limits = (await response.json() as { limits?: Array<Partial<ClaudeUsageLimit> | null> } | null)?.limits;
+	const body = await response.json() as { limits?: unknown } | null;
+	const limits = body?.limits;
 	if (!Array.isArray(limits)) throw new Error("Claude usage response has no limits.");
 	// Undocumented endpoint: skip entries whose shape changed instead of failing on them.
 	return limits.filter((limit): limit is ClaudeUsageLimit => typeof limit?.kind === "string" && Number.isFinite(limit.percent));
