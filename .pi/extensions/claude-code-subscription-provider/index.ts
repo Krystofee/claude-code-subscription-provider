@@ -521,19 +521,39 @@ function formatResetIn(resetAt: number, now = Date.now()): string {
 	return `${minutes}m`;
 }
 
-function formatRateLimitHeaders(headers: Record<string, string>): string | undefined {
-	const windows = ["5h", "7d"].flatMap((window) => {
-		const utilization = getHeader(headers, `anthropic-ratelimit-unified-${window}-utilization`);
-		return utilization === undefined ? [] : [`${window} ${Math.round(Number(utilization) * 100)}%`];
-	});
-	return windows.length ? `Claude ${windows.join(" · ")}` : undefined;
+function formatTimeOfDay(at: number, now = Date.now()): string {
+	const date = new Date(at);
+	const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+	return at - now < 24 * 60 * 60 * 1000 ? time : `${date.toLocaleDateString("en-US", { weekday: "short" })} ${time}`;
 }
 
-function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
+function formatRateLimitHeaders(headers: Record<string, string>): string | undefined {
+	const parts: string[] = [];
+	const fiveHour = getHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
+	if (fiveHour !== undefined) {
+		const resetAt = Number(getHeader(headers, "anthropic-ratelimit-unified-5h-reset")) * 1000;
+		parts.push(`5h ${Math.round(Number(fiveHour) * 100)}% (resets ${formatTimeOfDay(resetAt)})`);
+	}
+	const sevenDay = getHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
+	if (sevenDay !== undefined) parts.push(`7d ${Math.round(Number(sevenDay) * 100)}%`);
+	return parts.length ? `Claude ${parts.join(" · ")}` : undefined;
+}
+
+function usageLimitLabel(limit: ClaudeUsageLimit): string {
 	const label = USAGE_LIMIT_LABELS.get(limit.kind) ?? limit.kind;
 	const model = limit.scope?.model?.display_name;
-	const reset = limit.resets_at ? `, resets in ${formatResetIn(Date.parse(limit.resets_at), now)}` : "";
-	return `${model ? `${label} ${model}` : label}: ${limit.percent}% used${reset}`;
+	return model ? `${label} (${model})` : label;
+}
+
+function formatUsageLimits(limits: ClaudeUsageLimit[], now = Date.now()): string {
+	const rows = limits.map((limit) => [
+		usageLimitLabel(limit),
+		`${limit.percent}% used`,
+		limit.resets_at ? `resets in ${formatResetIn(Date.parse(limit.resets_at), now)}` : "",
+	]);
+	const labelWidth = Math.max(...rows.map(([label]) => label.length));
+	const usedWidth = Math.max(...rows.map(([, used]) => used.length));
+	return rows.map(([label, used, reset]) => `${label.padEnd(labelWidth)}   ${used.padStart(usedWidth)}   ${reset}`.trimEnd()).join("\n");
 }
 
 async function fetchUsageLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<ClaudeUsageLimit[]> {
@@ -549,8 +569,12 @@ async function fetchUsageLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSig
 
 async function describeExhaustedLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl?: typeof fetch): Promise<string> {
 	const limits = await fetchUsageLimits(bundle, signal, fetchImpl);
-	const exhausted = limits.filter((limit) => limit.percent >= 100).map((limit) => formatUsageLimit(limit));
-	return exhausted.length ? `${exhausted.join("; ")}.` : "";
+	const exhausted = limits.filter((limit) => limit.percent >= 100).map((limit) => {
+		if (!limit.resets_at) return usageLimitLabel(limit);
+		const resetAt = Date.parse(limit.resets_at);
+		return `${usageLimitLabel(limit)}, resets in ${formatResetIn(resetAt)} (${formatTimeOfDay(resetAt)})`;
+	});
+	return exhausted.length ? `Limit reached: ${exhausted.join("; ")}.` : "";
 }
 
 function createProviderError(model: Model<Api>, message: string, aborted = false): AssistantMessage {
@@ -668,7 +692,7 @@ async function getTokenBundle(forceRefresh = false, signal?: AbortSignal, env: N
 
 async function describeUsageLimits(signal?: AbortSignal): Promise<string> {
 	const limits = await fetchUsageLimits(await getTokenBundle(false, signal), signal);
-	return limits.map((limit) => formatUsageLimit(limit)).join("\n");
+	return formatUsageLimits(limits);
 }
 
 function providerHeaders(bundle: ClaudeCodeTokenBundle, model: Model<Api>, sessionId: string, extraBetas?: string): Record<string, string> {
@@ -916,7 +940,7 @@ export {
 	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
 	fetchUsageLimits,
-	formatUsageLimit,
+	formatUsageLimits,
 	getTokenBundle,
 	isAuthenticationError,
 	loginClaudeCode,
