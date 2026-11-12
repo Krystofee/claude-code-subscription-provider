@@ -373,7 +373,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	try {
 		const wire: Wire[] = [];
 		let config!: ProviderConfig;
-		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {}, on: () => {} } as unknown as ExtensionAPI);
+		registerProvider({ registerProvider: (_name: string, value: ProviderConfig) => { config = value; }, registerCommand: () => {}, registerTool: () => {}, on: () => {} } as unknown as ExtensionAPI);
 		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
 		runtime.registerProvider(CLAUDE_CODE_PROVIDER, { ...config, streamSimple: (selected, input, options) => streamClaudeCodeProvider(selected, input, { ...options, fetch: fixtureFetch(wire) }, loadToken) });
 		await runtime.refresh({ allowNetwork: false });
@@ -403,7 +403,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 
 test("footer shows usage only for this provider and clears when switching away", () => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
-	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
+	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, registerTool: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
 	const statuses: Array<string | undefined> = [];
 	const ctx = (provider: string) => ({ model: { provider }, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } });
 	const respond = (provider: string, headers: Record<string, string>) => handlers.get("after_provider_response")!({ status: 200, headers }, ctx(provider));

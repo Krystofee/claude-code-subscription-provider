@@ -111,6 +111,7 @@ Co dělá:
 - login jde přímo z pi: `/claude-code-auth login` spustí `claude auth login --claudeai`, otevře prohlížeč a případně si řekne o vložený kód; chyby přihlášení (odhlášeno, expirovaný refresh token, odmítnutý token) na tenhle příkaz odkazují
 - ve footeru ukazuje využití subscription limitů z response headerů (`anthropic-ratelimit-unified-*`) úspěšných odpovědí, např. `Claude 5h 22% · 7d 29%`
 - `/claude-code-auth usage` vypíše všechny limity z `/api/oauth/usage` (stejný endpoint jako `/usage` v Claude Code), včetně per-model weekly limitů (např. Fable), které v headerech nejsou
+- agent si stejné limity zjistí toolem `claude_subscription_usage`, např. před spuštěním víc paralelních subagentů
 - při 429 doplní do chyby, který limit je vyčerpaný a kdy se resetuje (lookup používá token právě odmítnutého requestu, nikdy ho neobnovuje, a když selže, zůstane původní chyba)
 
 Instalace user-level z repozitáře:

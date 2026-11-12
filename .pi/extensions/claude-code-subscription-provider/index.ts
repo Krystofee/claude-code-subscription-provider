@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 import {
 	createAssistantMessageEventStream,
 	anthropicMessagesApi,
@@ -664,6 +665,11 @@ async function getTokenBundle(forceRefresh = false, signal?: AbortSignal, env: N
 	}
 }
 
+async function describeUsageLimits(signal?: AbortSignal): Promise<string> {
+	const limits = await fetchUsageLimits(await getTokenBundle(false, signal), signal);
+	return limits.map((limit) => formatUsageLimit(limit)).join("\n");
+}
+
 function providerHeaders(bundle: ClaudeCodeTokenBundle, model: Model<Api>, sessionId: string, extraBetas?: string): Record<string, string> {
 	return {
 		"anthropic-beta": betaHeaderForModel(model, extraBetas),
@@ -837,6 +843,18 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 		if (event.model.provider !== CLAUDE_CODE_PROVIDER) ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
 	});
 
+	pi.registerTool({
+		name: "claude_subscription_usage",
+		label: "Claude subscription usage",
+		description: "Show how much of the Claude subscription rate limits is used and when each limit resets: the 5-hour session, the weekly limit and per-model weekly limits.",
+		promptSnippet: "Check how much Claude subscription rate limit remains",
+		promptGuidelines: ["Use claude_subscription_usage before starting long or parallel work on Claude subscription models, such as several subagents, to check how much rate limit remains."],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal) {
+			return { content: [{ type: "text", text: await describeUsageLimits(signal) }], details: undefined };
+		},
+	});
+
 	pi.registerCommand("claude-code-auth", {
 		description: "Log in to Claude Code, show subscription usage limits, or check, refresh or clear the cached access token",
 		handler: async (args, ctx) => {
@@ -861,8 +879,7 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 			}
 			if (args.trim() === "usage") {
 				try {
-					const limits = await fetchUsageLimits(await getTokenBundle());
-					ctx.ui.notify(limits.map((limit) => formatUsageLimit(limit)).join("\n"), "info");
+					ctx.ui.notify(await describeUsageLimits(), "info");
 				} catch (error) {
 					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				}
