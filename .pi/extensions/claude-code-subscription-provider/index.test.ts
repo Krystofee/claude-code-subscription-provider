@@ -415,7 +415,7 @@ test("footer shows each available limit for this provider only and clears when s
 	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-status": "allowed" });
 	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
 	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
-	assert.deepEqual(statuses, ["Claude 5h 22% (resets 18:50) · 7d 29%", "Claude 7d 31%", undefined]);
+	assert.deepEqual(statuses, ["Claude 5h: 22% (resets 18:50) · 7d: 29%", "Claude 7d: 31%", undefined]);
 });
 
 function usageResponse(limits: unknown[]): Response {

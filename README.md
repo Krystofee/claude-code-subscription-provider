@@ -109,7 +109,7 @@ Co dělá:
 - respektuje `maxTokens`, `cacheRetention: "none"` i system instructions; session ID a billing prefix zůstávají stabilní v rámci session
 - nativní `/compact` i `/tree` se summary používají stejný provider; auxiliary request bez reasoning zůstává validní i na always-on-thinking modelech
 - login jde přímo z pi: `/claude-code-auth login` spustí `claude auth login --claudeai`, otevře prohlížeč a případně si řekne o vložený kód; chyby přihlášení (odhlášeno, expirovaný refresh token, odmítnutý token) na tenhle příkaz odkazují
-- ve footeru ukazuje využití subscription limitů z response headerů (`anthropic-ratelimit-unified-*`) úspěšných odpovědí, např. `Claude 5h 22% (resets 19:50) · 7d 29%`; každý limit zvlášť, takže když API pošle jen weekly, ukáže `Claude 7d 31%`
+- ve footeru ukazuje využití subscription limitů z response headerů (`anthropic-ratelimit-unified-*`) úspěšných odpovědí, např. `Claude 5h: 22% (resets 19:50) · 7d: 29%`; každý limit zvlášť, takže když API pošle jen weekly, ukáže `Claude 7d: 31%`
 - `/claude-code-auth usage` vypíše všechny limity z `/api/oauth/usage` (stejný endpoint jako `/usage` v Claude Code), včetně per-model weekly limitů (např. Fable), které v headerech nejsou
 - agent si stejné limity zjistí toolem `claude_subscription_usage`, např. před spuštěním víc paralelních subagentů
 - při 429 doplní do chyby, který limit je vyčerpaný a kdy se resetuje (lookup používá token právě odmítnutého requestu, nikdy ho neobnovuje, a když selže, zůstane původní chyba)

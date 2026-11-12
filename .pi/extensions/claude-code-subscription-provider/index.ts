@@ -532,10 +532,10 @@ function formatRateLimitHeaders(headers: Record<string, string>): string | undef
 	const fiveHour = getHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
 	if (fiveHour !== undefined) {
 		const resetAt = Number(getHeader(headers, "anthropic-ratelimit-unified-5h-reset")) * 1000;
-		parts.push(`5h ${Math.round(Number(fiveHour) * 100)}% (resets ${formatTimeOfDay(resetAt)})`);
+		parts.push(`5h: ${Math.round(Number(fiveHour) * 100)}% (resets ${formatTimeOfDay(resetAt)})`);
 	}
 	const sevenDay = getHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
-	if (sevenDay !== undefined) parts.push(`7d ${Math.round(Number(sevenDay) * 100)}%`);
+	if (sevenDay !== undefined) parts.push(`7d: ${Math.round(Number(sevenDay) * 100)}%`);
 	return parts.length ? `Claude ${parts.join(" · ")}` : undefined;
 }
 
