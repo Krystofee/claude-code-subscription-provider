@@ -459,3 +459,17 @@ test("a 429 names the exhausted subscription limit and keeps the original error"
 	assert.doesNotMatch(result.errorMessage!, /Weekly/);
 	assert.equal(wire.length, 1);
 });
+
+test("cancelling during the 429 usage lookup ends the request as aborted", async () => {
+	const controller = new AbortController();
+	const stream = streamClaudeCodeProvider(model(), context(), {
+		signal: controller.signal,
+		fetch: async (url, init) => {
+			if (!String(url).endsWith("/api/oauth/usage")) return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } });
+			controller.abort();
+			assert.equal(init!.signal!.aborted, true);
+			throw init!.signal!.reason;
+		},
+	}, loadToken);
+	assert.equal((await stream.result()).stopReason, "aborted");
+});
