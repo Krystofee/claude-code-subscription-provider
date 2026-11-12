@@ -521,45 +521,28 @@ function formatResetIn(resetAt: number, now = Date.now()): string {
 }
 
 function formatRateLimitHeaders(headers: Record<string, string>): string | undefined {
-	const windows = ["5h", "7d"].flatMap((window) => {
-		const utilization = Number(getHeader(headers, `anthropic-ratelimit-unified-${window}-utilization`));
-		return Number.isFinite(utilization) ? [`${window} ${Math.round(utilization * 100)}%`] : [];
-	});
-	return windows.length ? `Claude ${windows.join(" · ")}` : undefined;
+	const fiveHour = getHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
+	const sevenDay = getHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
+	if (fiveHour === undefined || sevenDay === undefined) return undefined;
+	return `Claude 5h ${Math.round(Number(fiveHour) * 100)}% · 7d ${Math.round(Number(sevenDay) * 100)}%`;
 }
 
 function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
 	const label = USAGE_LIMIT_LABELS.get(limit.kind) ?? limit.kind;
 	const model = limit.scope?.model?.display_name;
-	const resetAt = Date.parse(limit.resets_at ?? "");
-	const reset = Number.isFinite(resetAt) ? `, resets in ${formatResetIn(resetAt, now)}` : "";
+	const reset = limit.resets_at ? `, resets in ${formatResetIn(Date.parse(limit.resets_at), now)}` : "";
 	return `${model ? `${label} ${model}` : label}: ${limit.percent}% used${reset}`;
 }
 
-async function fetchUsageLimits(
-	bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch,
-	loadFreshToken?: () => Promise<ClaudeCodeTokenBundle>,
-): Promise<ClaudeUsageLimit[]> {
-	const request = (token: ClaudeCodeTokenBundle) => {
-		const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
-		return fetchImpl(USAGE_URL, {
-			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-			headers: { authorization: `Bearer ${token.accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
-		});
-	};
-	const firstResponse = await request(bundle);
-	const shouldRetryWithFreshToken = firstResponse.status === 401 && loadFreshToken !== undefined;
-	if (shouldRetryWithFreshToken) await firstResponse.body?.cancel();
-	const response = shouldRetryWithFreshToken ? await request(await loadFreshToken()) : firstResponse;
-	if (!response.ok) {
-		await response.body?.cancel();
-		throw new Error(`Claude usage request failed (${response.status}).`);
-	}
-	const body = await response.json() as { limits?: unknown } | null;
-	const limits = body?.limits;
-	if (!Array.isArray(limits)) throw new Error("Claude usage response has no limits.");
-	// Undocumented endpoint: skip entries whose shape changed instead of failing on them.
-	return limits.filter((limit): limit is ClaudeUsageLimit => typeof limit?.kind === "string" && Number.isFinite(limit.percent));
+async function fetchUsageLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<ClaudeUsageLimit[]> {
+	const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
+	const response = await fetchImpl(USAGE_URL, {
+		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+		headers: { authorization: `Bearer ${bundle.accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
+	});
+	if (!response.ok) throw new Error(`Claude usage request failed (${response.status}).`);
+	const body = await response.json() as { limits: ClaudeUsageLimit[] };
+	return body.limits;
 }
 
 async function describeExhaustedLimits(bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl?: typeof fetch): Promise<string> {
@@ -878,8 +861,8 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 			}
 			if (args.trim() === "usage") {
 				try {
-					const limits = await fetchUsageLimits(await getTokenBundle(), undefined, fetch, () => getTokenBundle(true));
-					ctx.ui.notify(limits.length ? limits.map((limit) => formatUsageLimit(limit)).join("\n") : "No usage limits reported.", "info");
+					const limits = await fetchUsageLimits(await getTokenBundle());
+					ctx.ui.notify(limits.map((limit) => formatUsageLimit(limit)).join("\n"), "info");
 				} catch (error) {
 					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				}

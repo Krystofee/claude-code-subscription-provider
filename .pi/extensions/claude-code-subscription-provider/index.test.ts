@@ -401,7 +401,7 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	}
 });
 
-test("footer shows usage only for this provider, skips malformed headers and clears when switching away", () => {
+test("footer shows usage only for this provider and clears when switching away", () => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
 	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
 	const statuses: Array<string | undefined> = [];
@@ -410,11 +410,10 @@ test("footer shows usage only for this provider, skips malformed headers and cle
 	const headers = { "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" };
 	respond("anthropic", headers);
 	respond(CLAUDE_CODE_PROVIDER, headers);
-	respond(CLAUDE_CODE_PROVIDER, { ...headers, "anthropic-ratelimit-unified-5h-utilization": "n/a" });
 	respond(CLAUDE_CODE_PROVIDER, { "anthropic-ratelimit-unified-status": "allowed" });
 	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
 	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
-	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", "Claude 7d 29%", undefined]);
+	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", undefined]);
 });
 
 function usageResponse(limits: unknown[]): Response {
@@ -425,18 +424,16 @@ function rateLimited(): Response {
 	return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } });
 }
 
-test("usage limits label per-model limits and skip entries whose shape changed", async () => {
+test("usage limits label per-model limits", async () => {
 	const now = Date.UTC(2026, 10, 12, 12);
 	const usage = await fetchUsageLimits(token, undefined, async (url, init) => {
 		assert.equal(url, "https://api.anthropic.com/api/oauth/usage");
 		assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
 		return usageResponse([
 			{ kind: "session", percent: 22, resets_at: "2026-11-12T15:30:00Z", scope: null },
-			null,
-			{ kind: "weekly_all", percent: 29, resets_at: "2026-11-16T18:00:00Z" },
-			{ kind: "weekly_all", resets_at: "2026-11-16T18:00:00Z" },
+			{ kind: "weekly_all", percent: 29, resets_at: "2026-11-16T18:00:00Z", scope: null },
 			{ kind: "weekly_scoped", percent: 10, resets_at: "2026-11-16T18:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
-			{ kind: "weekly_oauth_apps", percent: 0, resets_at: null },
+			{ kind: "weekly_oauth_apps", percent: 0, resets_at: null, scope: null },
 		]);
 	});
 	assert.deepEqual(usage.map((limit) => formatUsageLimit(limit, now)), [
@@ -445,24 +442,6 @@ test("usage limits label per-model limits and skip entries whose shape changed",
 		"Weekly Fable: 10% used, resets in 4d 6h",
 		"weekly_oauth_apps: 0% used",
 	]);
-});
-
-test("usage lookups retry with a fresh token on 401 but not on other failures", async () => {
-	const refreshed = { ...token, accessToken: "sk-ant-oat-REFRESHED-FIXTURE" };
-	const lookUpAfter = (status: number) => {
-		const sentTokens: string[] = [];
-		const usage = fetchUsageLimits(token, undefined, async (_url, init) => {
-			sentTokens.push(new Headers(init?.headers).get("authorization")!);
-			return sentTokens.length === 1 ? new Response("{}", { status }) : usageResponse([{ kind: "session", percent: 1, resets_at: null }]);
-		}, async () => refreshed);
-		return { sentTokens, usage };
-	};
-	const unauthorized = lookUpAfter(401);
-	assert.equal((await unauthorized.usage).length, 1);
-	assert.deepEqual(unauthorized.sentTokens, [`Bearer ${token.accessToken}`, `Bearer ${refreshed.accessToken}`]);
-	const forbidden = lookUpAfter(403);
-	await assert.rejects(forbidden.usage, /failed \(403\)/);
-	assert.deepEqual(forbidden.sentTokens, [`Bearer ${token.accessToken}`]);
 });
 
 test("a 429 names the exhausted subscription limit with the request's own token", async () => {
@@ -490,8 +469,8 @@ test("a 429 names the exhausted subscription limit with the request's own token"
 	assert.equal(loads, 1);
 });
 
-test("a failed or malformed usage lookup keeps the original 429 and never refreshes the token", async () => {
-	for (const usage of [() => new Response("{}", { status: 401 }), () => new Response("not json", { status: 200 }), () => usageResponse([{ percent: 100 }])]) {
+test("a failed usage lookup keeps the original 429 and never refreshes the token", async () => {
+	for (const usage of [() => new Response("{}", { status: 401 }), () => new Response("not json", { status: 200 })]) {
 		let loads = 0;
 		const stream = streamClaudeCodeProvider(model(), context(), {
 			fetch: async (url) => String(url).endsWith("/api/oauth/usage") ? usage() : rateLimited(),
