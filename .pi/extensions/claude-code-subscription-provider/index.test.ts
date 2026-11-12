@@ -401,63 +401,90 @@ for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact an
 	}
 });
 
-test("summarizes subscription rate limit headers for the footer", () => {
-	const now = Date.UTC(2026, 10, 12, 12);
-	const headers = {
-		"anthropic-ratelimit-unified-status": "allowed",
-		"anthropic-ratelimit-unified-5h-utilization": "0.22",
-		"anthropic-ratelimit-unified-7d-utilization": "0.29",
-		"anthropic-ratelimit-unified-reset": String(now / 1000 + 2 * 3600 + 600),
-	};
-	assert.equal(formatRateLimitHeaders(headers, now), "Claude 5h 22% · 7d 29%");
-	assert.equal(
-		formatRateLimitHeaders({ ...headers, "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-5h-utilization": "1.0" }, now),
-		"Claude limit reached, resets in 2h 10m · 5h 100% · 7d 29%",
-	);
-	assert.equal(formatRateLimitHeaders({ "content-type": "application/json" }, now), undefined);
+test("summarizes subscription rate limit headers for the footer and ignores malformed ones", () => {
+	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" }), "Claude 5h 22% · 7d 29%");
+	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-5h-utilization": "n/a", "anthropic-ratelimit-unified-7d-utilization": "0.29" }), "Claude 7d 29%");
+	assert.equal(formatRateLimitHeaders({ "anthropic-ratelimit-unified-status": "allowed" }), undefined);
+});
+
+test("footer shows usage only for this provider and clears when switching away", () => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+	registerProvider({ registerProvider: () => {}, registerCommand: () => {}, on: (name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.set(name, handler) } as unknown as ExtensionAPI);
+	const statuses: Array<string | undefined> = [];
+	const ctx = (provider: string) => ({ model: { provider }, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } });
+	const headers = { "anthropic-ratelimit-unified-5h-utilization": "0.22", "anthropic-ratelimit-unified-7d-utilization": "0.29" };
+	handlers.get("after_provider_response")!({ status: 200, headers }, ctx("anthropic"));
+	handlers.get("after_provider_response")!({ status: 200, headers }, ctx(CLAUDE_CODE_PROVIDER));
+	handlers.get("model_select")!({ model: { provider: CLAUDE_CODE_PROVIDER } }, ctx(CLAUDE_CODE_PROVIDER));
+	handlers.get("model_select")!({ model: { provider: "anthropic" } }, ctx("anthropic"));
+	assert.deepEqual(statuses, ["Claude 5h 22% · 7d 29%", undefined]);
 });
 
 function usageResponse(limits: unknown[]): Response {
 	return new Response(JSON.stringify({ limits }), { headers: { "content-type": "application/json" } });
 }
 
-test("usage limits refresh a rejected token once and label per-model limits", async () => {
+function rateLimited(): Response {
+	return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } });
+}
+
+test("usage limits label per-model limits and skip entries whose shape changed", async () => {
 	const now = Date.UTC(2026, 10, 12, 12);
-	const refreshes: boolean[] = [];
-	const usage = await fetchUsageLimits(undefined, async (forceRefresh = false) => { refreshes.push(forceRefresh); return token; }, async (url, init) => {
+	const usage = await fetchUsageLimits(token, undefined, async (url, init) => {
 		assert.equal(url, "https://api.anthropic.com/api/oauth/usage");
 		assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
-		if (refreshes.length === 1) return new Response("{}", { status: 401 });
 		return usageResponse([
 			{ kind: "session", percent: 22, resets_at: "2026-11-12T15:30:00Z", scope: null },
+			null,
+			{ kind: "weekly_all", resets_at: "2026-11-16T18:00:00Z" },
 			{ kind: "weekly_scoped", percent: 10, resets_at: "2026-11-16T18:00:00Z", scope: { model: { id: null, display_name: "Fable" } } },
+			{ kind: "weekly_oauth_apps", percent: 0, resets_at: null },
 		]);
 	});
-	assert.deepEqual(refreshes, [false, true]);
 	assert.deepEqual(usage.map((limit) => formatUsageLimit(limit, now)), [
 		"Session (5h): 22% used, resets in 3h 30m",
 		"Weekly Fable: 10% used, resets in 4d 6h",
+		"Weekly: 0% used",
 	]);
 });
 
-test("a 429 names the exhausted subscription limit and keeps the original error", async () => {
+test("a 429 names the exhausted subscription limit with the request's own token", async () => {
 	const resetsAt = new Date(Date.now() + 90 * 60_000).toISOString();
 	const wire: Wire[] = [];
+	let loads = 0;
 	const stream = streamClaudeCodeProvider(model(), context(), {
 		fetch: async (url, init) => {
-			if (String(url).endsWith("/api/oauth/usage")) return usageResponse([
-				{ kind: "session", percent: 100, resets_at: resetsAt, scope: null },
-				{ kind: "weekly_all", percent: 40, resets_at: resetsAt, scope: null },
-			]);
-			return fixtureFetch(wire, () => new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } }))(url, init);
+			if (String(url).endsWith("/api/oauth/usage")) {
+				assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${token.accessToken}`);
+				return usageResponse([
+					{ kind: "session", percent: 100, resets_at: resetsAt, scope: null },
+					{ kind: "weekly_all", percent: 40, resets_at: resetsAt, scope: null },
+				]);
+			}
+			return fixtureFetch(wire, rateLimited)(url, init);
 		},
-	}, loadToken);
+	}, async () => { loads++; return token; });
 	const result = await stream.result();
 	assert.equal(result.stopReason, "error");
 	assert.match(result.errorMessage!, /Rate limited/);
 	assert.match(result.errorMessage!, /Session \(5h\): 100% used, resets in 1h 30m\.$/);
 	assert.doesNotMatch(result.errorMessage!, /Weekly/);
 	assert.equal(wire.length, 1);
+	assert.equal(loads, 1);
+});
+
+test("a failed or malformed usage lookup keeps the original 429 and never refreshes the token", async () => {
+	for (const usage of [() => new Response("{}", { status: 401 }), () => new Response("not json", { status: 200 }), () => usageResponse([{ percent: 100 }])]) {
+		let loads = 0;
+		const stream = streamClaudeCodeProvider(model(), context(), {
+			fetch: async (url) => String(url).endsWith("/api/oauth/usage") ? usage() : rateLimited(),
+		}, async () => { loads++; return token; });
+		const result = await stream.result();
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage!, /Rate limited/);
+		assert.doesNotMatch(result.errorMessage!, /used|Cannot read|usage/);
+		assert.equal(loads, 1);
+	}
 });
 
 test("cancelling during the 429 usage lookup ends the request as aborted", async () => {
@@ -465,7 +492,7 @@ test("cancelling during the 429 usage lookup ends the request as aborted", async
 	const stream = streamClaudeCodeProvider(model(), context(), {
 		signal: controller.signal,
 		fetch: async (url, init) => {
-			if (!String(url).endsWith("/api/oauth/usage")) return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Rate limited" } }), { status: 429, headers: { "content-type": "application/json" } });
+			if (!String(url).endsWith("/api/oauth/usage")) return rateLimited();
 			controller.abort();
 			assert.equal(init!.signal!.aborted, true);
 			throw init!.signal!.reason;
