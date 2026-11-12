@@ -8,7 +8,7 @@ import { normalizeContext, getSupportedThinkingLevels, type Model, type Api, typ
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession, generateSummaryWithUsage, generateBranchSummary, type ProviderConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, fetchUsageLimitsWithRefresh, formatUsageLimit, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
+import registerProvider, { CLAUDE_CODE_MODELS, CLAUDE_CODE_PROVIDER, captureFreshTokenBundle, fetchUsageLimits, formatUsageLimit, isAuthenticationError, loginClaudeCode, normalizeClaudeCodeUserAgent, rewriteClaudeCodePayload, runJsonCommand, streamClaudeCodeProvider } from "./index.ts";
 
 const token = { accessToken: "sk-ant-oat-AUDIT-FIXTURE-NOT-A-REAL-TOKEN", capturedAt: Date.now(), expiresAt: Date.now() + 3600000 };
 const loadToken = async () => token;
@@ -447,14 +447,17 @@ test("usage limits label per-model limits and skip entries whose shape changed",
 	]);
 });
 
-test("the usage command refreshes the token once on 401 but not on other failures", async () => {
-	for (const [status, refreshes] of [[401, [false, true]], [403, [false]]] as const) {
-		const loads: boolean[] = [];
-		const usage = fetchUsageLimitsWithRefresh(async (forceRefresh = false) => { loads.push(forceRefresh); return token; }, async () =>
-			loads.length === 1 ? new Response("{}", { status }) : usageResponse([{ kind: "session", percent: 1, resets_at: null }]));
+test("usage lookups refresh the token once on 401 but not on other failures", async () => {
+	const refreshed = { ...token, accessToken: "sk-ant-oat-REFRESHED-FIXTURE" };
+	for (const [status, expectedTokens] of [[401, [token, refreshed]], [403, [token]]] as const) {
+		const sentTokens: string[] = [];
+		const usage = fetchUsageLimits(token, undefined, async (_url, init) => {
+			sentTokens.push(new Headers(init?.headers).get("authorization")!);
+			return sentTokens.length === 1 ? new Response("{}", { status }) : usageResponse([{ kind: "session", percent: 1, resets_at: null }]);
+		}, async () => refreshed);
 		if (status === 401) assert.equal((await usage).length, 1);
 		else await assert.rejects(usage, /failed \(403\)/);
-		assert.deepEqual(loads, refreshes);
+		assert.deepEqual(sentTokens, expectedTokens.map((bundle) => `Bearer ${bundle.accessToken}`));
 	}
 });
 

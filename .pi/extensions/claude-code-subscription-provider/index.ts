@@ -538,16 +538,19 @@ function formatUsageLimit(limit: ClaudeUsageLimit, now = Date.now()): string {
 
 async function fetchUsageLimits(
 	bundle: ClaudeCodeTokenBundle, signal?: AbortSignal, fetchImpl: typeof fetch = fetch,
+	refreshToken?: () => Promise<ClaudeCodeTokenBundle>,
 ): Promise<ClaudeUsageLimit[]> {
-	const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
-	const response = await fetchImpl(USAGE_URL, {
-		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-		headers: {
-			authorization: `Bearer ${bundle.accessToken}`,
-			"anthropic-beta": "oauth-2025-04-20",
-			"user-agent": normalizeClaudeCodeUserAgent(bundle.userAgent),
-		},
-	});
+	const request = (token: ClaudeCodeTokenBundle) => {
+		const timeout = AbortSignal.timeout(USAGE_TIMEOUT_MS);
+		return fetchImpl(USAGE_URL, {
+			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+			headers: { authorization: `Bearer ${token.accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
+		});
+	};
+	const cachedTokenResponse = await request(bundle);
+	const refresh = cachedTokenResponse.status === 401 && refreshToken;
+	if (refresh) await cachedTokenResponse.body?.cancel();
+	const response = refresh ? await request(await refresh()) : cachedTokenResponse;
 	if (!response.ok) {
 		await response.body?.cancel();
 		throw new Error(`Claude usage request failed (${response.status}).`);
@@ -674,16 +677,6 @@ async function getTokenBundle(forceRefresh = false, signal?: AbortSignal, env: N
 			inflightTokenRefresh = null;
 			refresh.controller.abort();
 		}
-	}
-}
-
-async function fetchUsageLimitsWithRefresh(loadToken = getTokenBundle, fetchImpl: typeof fetch = fetch): Promise<ClaudeUsageLimit[]> {
-	const bundle = await loadToken();
-	try {
-		return await fetchUsageLimits(bundle, undefined, fetchImpl);
-	} catch (error) {
-		if (!(error instanceof Error) || !isAuthenticationError(error.message)) throw error;
-		return fetchUsageLimits(await loadToken(true), undefined, fetchImpl);
 	}
 }
 
@@ -884,7 +877,7 @@ export default function registerClaudeCodeProvider(pi: ExtensionAPI) {
 			}
 			if (args.trim() === "usage") {
 				try {
-					const limits = await fetchUsageLimitsWithRefresh();
+					const limits = await fetchUsageLimits(await getTokenBundle(), undefined, fetch, () => getTokenBundle(true));
 					ctx.ui.notify(limits.length ? limits.map((limit) => formatUsageLimit(limit)).join("\n") : "No usage limits reported.", "info");
 				} catch (error) {
 					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -921,7 +914,6 @@ export {
 	DEFAULT_MODEL_ID,
 	captureFreshTokenBundle,
 	fetchUsageLimits,
-	fetchUsageLimitsWithRefresh,
 	formatUsageLimit,
 	getTokenBundle,
 	isAuthenticationError,
