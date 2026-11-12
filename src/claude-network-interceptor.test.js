@@ -62,7 +62,7 @@ async function fakeClaude(directory, source) {
   return { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`, TMPDIR: directory };
 }
 
-test('capture worker intercepts a TLS request locally, emits only the token bundle and cleans its CA', async () => {
+test('capture worker intercepts parallel TLS requests locally, emits only the token bundle, exits and cleans its CA', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-capture-test-'));
   try {
     const env = await fakeClaude(directory, `
@@ -70,17 +70,19 @@ test('capture worker intercepts a TLS request locally, emits only the token bund
       const tls = require('node:tls');
       const fs = require('node:fs');
       const proxy = new URL(process.env.HTTPS_PROXY);
-      const request = http.request({ host: proxy.hostname, port: proxy.port, method: 'CONNECT', path: 'api.anthropic.com:443' });
-      request.on('connect', (_response, socket) => {
-        const secure = tls.connect({ socket, servername: 'api.anthropic.com', ca: fs.readFileSync(process.env.NODE_EXTRA_CA_CERTS) }, () => {
-          secure.write('POST /v1/messages HTTP/1.1\\r\\nHost: api.anthropic.com\\r\\nAuthorization: Bearer sk-ant-oat-TEST-FIXTURE\\r\\nUser-Agent: claude-cli/2.1.280\\r\\nContent-Length: 2\\r\\n\\r\\n{}');
+      for (let i = 0; i < 2; i++) {
+        const request = http.request({ host: proxy.hostname, port: proxy.port, method: 'CONNECT', path: 'api.anthropic.com:443' });
+        request.on('connect', (_response, socket) => {
+          const secure = tls.connect({ socket, servername: 'api.anthropic.com', ca: fs.readFileSync(process.env.NODE_EXTRA_CA_CERTS) }, () => {
+            secure.write('POST /v1/messages HTTP/1.1\\r\\nHost: api.anthropic.com\\r\\nAuthorization: Bearer sk-ant-oat-TEST-FIXTURE\\r\\nUser-Agent: claude-cli/2.1.280\\r\\nContent-Length: 2\\r\\n\\r\\n{}');
+          });
+          secure.on('error', () => {});
+          secure.resume();
         });
-        secure.on('error', () => {});
-        secure.resume();
-      });
-      request.end();
+        request.end();
+      }
     `);
-    const { stdout } = await execute(process.execPath, [script, '--capture-token'], { env, timeout: 15000 });
+    const { stdout } = await execute(process.execPath, [script, '--capture-token'], { env, timeout: 15000, killSignal: 'SIGKILL' });
     const bundle = JSON.parse(stdout);
     assert.equal(bundle.accessToken, 'sk-ant-oat-TEST-FIXTURE');
     assert.equal(bundle.userAgent, 'claude-cli/2.1.280');

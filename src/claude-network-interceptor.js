@@ -728,9 +728,10 @@ if (require.main === module) {
     process.once('SIGTERM', () => controller.abort());
     process.once('SIGINT', () => controller.abort());
     const modelIndex = process.argv.indexOf('--model');
+    // Exit explicitly: http-mitm-proxy orphans a per-host server on parallel CONNECTs, keeping the loop alive.
     captureClaudeCodeToken(modelIndex < 0 ? 'claude-opus-4-8' : process.argv[modelIndex + 1], controller.signal)
-      .then((bundle) => process.stdout.write(`${JSON.stringify(bundle)}\n`))
-      .catch(() => { process.exitCode = 1; });
+      .then((bundle) => process.stdout.write(`${JSON.stringify(bundle)}\n`, () => process.exit(0)))
+      .catch(() => process.exit(1));
   } else {
     main().catch((error) => {
       console.error(error.stack || error.message || String(error));
