@@ -99,6 +99,13 @@ const CLAUDE_CODE_MODEL_DEFS = [
 		maxTokens: 64_000,
 	},
 	{
+		id: "fable-5-2",
+		anthropicId: "claude-fable-5-2",
+		name: "Claude Code Subscription Provider / Fable 5.2 (1M)",
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+	},
+	{
 		id: "fable-5-1",
 		anthropicId: "claude-fable-5-1",
 		name: "Claude Code Subscription Provider / Fable 5.1 (1M)",
@@ -122,6 +129,17 @@ const CLAUDE_CODE_MODEL_DEFS = [
 ];
 
 const nativeModels = new Map(getBuiltinModels("anthropic").map((model) => [model.id, model]));
+// Pi 1.2 predates Fable 5.2. Reuse 5.1's streaming capabilities with 5.2 pricing.
+// https://platform.claude.com/docs/en/models/fable-5-2/migration-guide
+if (!nativeModels.has("claude-fable-5-2")) {
+	const previous = nativeModels.get("claude-fable-5-1");
+	if (previous) nativeModels.set("claude-fable-5-2", {
+		...previous,
+		id: "claude-fable-5-2",
+		name: "Claude Fable 5.2",
+		cost: { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 },
+	});
+}
 const CLAUDE_CODE_MODELS: ClaudeCodeModelDef[] = CLAUDE_CODE_MODEL_DEFS.map((model) => {
 	const native = nativeModels.get(model.anthropicId);
 	if (!native) throw new Error(`Pi's Anthropic catalog is missing ${model.anthropicId}. Update Pi.`);
@@ -155,11 +173,10 @@ const CACHE_FILE = path.join(
 );
 const CAPTURE_SCRIPT = fileURLToPath(new URL("../../../src/claude-network-interceptor.js", import.meta.url));
 const DEFAULT_SESSION_ID = randomUUID();
-// Bumped for Opus 5.5: older user agents get a 400 claude_code_version_too_old
-// ("Claude Code 2.1.251 does not support this model; version 2.1.280 or newer is
-// required"), so cached UAs below this are rewritten before we send them.
-const MINIMUM_CLAUDE_CODE_VERSION = [2, 1, 280] as const;
-const DEFAULT_USER_AGENT = "claude-cli/2.1.280 (external, sdk-cli)";
+// Fable 5.2 rejects older user agents with claude_code_version_too_old, so
+// cached UAs below the server's minimum are rewritten before we send them.
+const MINIMUM_CLAUDE_CODE_VERSION = [2, 1, 290] as const;
+const DEFAULT_USER_AGENT = "claude-cli/2.1.290 (external, sdk-cli)";
 const DEFAULT_X_APP = "cli";
 const DEFAULT_MAX_TOKENS = 64_000;
 const REQUIRED_BETAS = [
@@ -250,7 +267,7 @@ function betaHeaderForModel(model: Model<Api>, extra?: string): string {
 function buildBillingHeader(sessionId: string): string {
 	// A changing system prefix invalidates signed thinking replay and prompt caches.
 	const cch = 10000 + (parseInt(createHash("sha256").update(sessionId).digest("hex").slice(0, 8), 16) % 90000);
-	return `x-anthropic-billing-header: cc_version=2.1.280.714; cc_entrypoint=sdk-cli; cch=${cch};`;
+	return `x-anthropic-billing-header: cc_version=2.1.290.714; cc_entrypoint=sdk-cli; cch=${cch};`;
 }
 
 function wrapSystemReminder(text: string): string {

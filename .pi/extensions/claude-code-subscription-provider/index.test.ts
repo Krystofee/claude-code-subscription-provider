@@ -58,15 +58,18 @@ test("recognizes rotated OAuth tokens but not unrelated permission errors", () =
 });
 
 test("upgrades stale user agents without downgrading newer Claude Code", () => {
-	assert.equal(normalizeClaudeCodeUserAgent("claude-cli/2.1.251 (external, sdk-cli)"), "claude-cli/2.1.280 (external, sdk-cli)");
+	assert.equal(normalizeClaudeCodeUserAgent("claude-cli/2.1.251 (external, sdk-cli)"), "claude-cli/2.1.290 (external, sdk-cli)");
+	assert.equal(normalizeClaudeCodeUserAgent("claude-cli/2.1.280 (external, sdk-cli)"), "claude-cli/2.1.290 (external, sdk-cli)");
 	assert.equal(normalizeClaudeCodeUserAgent("claude-cli/2.1.299 (external, sdk-cli)"), "claude-cli/2.1.299 (external, sdk-cli)");
 });
 
 test("inherits current pricing, thinking capabilities and cache lifetimes from Pi", () => {
 	const native = new Map(getBuiltinModels("anthropic").map((m) => [m.id, m]));
 	for (const def of CLAUDE_CODE_MODELS) {
-		assert.deepEqual(def.cost, native.get(def.anthropicId)!.cost);
-		assert.deepEqual(def.thinkingLevelMap, native.get(def.anthropicId)!.thinkingLevelMap);
+		const expected = native.get(def.anthropicId) ?? native.get("claude-fable-5-1")!;
+		const expectedCost = def.id === "fable-5-2" ? { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 } : expected.cost;
+		assert.deepEqual(def.cost, expectedCost);
+		assert.deepEqual(def.thinkingLevelMap, expected.thinkingLevelMap);
 		assert.deepEqual(def.promptCache, { short: 300, long: 3600 });
 		assert.equal(def.compat?.forceAdaptiveThinking, true);
 	}
@@ -75,12 +78,33 @@ test("inherits current pricing, thinking capabilities and cache lifetimes from P
 });
 
 test("does not inflate small output caps or send disabled thinking to always-on models", async () => {
-	for (const id of ["opus-5-5", "opus-5", "fable-5-1", "fable-5"]) {
+	for (const id of ["opus-5-5", "opus-5", "fable-5-2", "fable-5-1", "fable-5"]) {
 		const { wire, result } = await call({ maxTokens: 1024, cacheRetention: "none" }, model(id));
 		assert.equal(result.stopReason, "stop", result.errorMessage ?? "");
 		assert.equal(wire[0].body.max_tokens, 1024);
 		assert.equal(wire[0].body.thinking.type, "adaptive");
 		assert.equal(JSON.stringify(wire[0].body).includes("cache_control"), false);
+	}
+});
+
+test("Fable 5.2 maps to the upstream model with adaptive thinking, 1M context and all effort levels", async () => {
+	const selected = model("fable-5-2");
+	assert.equal(selected.contextWindow, 1_000_000);
+	assert.equal(selected.maxTokens, 128_000);
+	assert.deepEqual(getSupportedThinkingLevels(selected), getSupportedThinkingLevels(model("fable-5-1")));
+	assert.equal((selected as Model<"anthropic-messages">).compat?.allowedFallbackModels, undefined);
+	for (const reasoning of ["low", "medium", "high", "xhigh", "max"] as const) {
+		const { wire, result } = await call({ reasoning }, selected);
+		assert.equal(result.stopReason, "stop", result.errorMessage ?? "");
+		assert.equal(result.model, "fable-5-2");
+		assert.equal(wire[0].body.model, "claude-fable-5-2");
+		assert.equal(wire[0].headers.get("user-agent"), "claude-cli/2.1.290 (external, sdk-cli)");
+		assert.match(JSON.stringify(wire[0].body.system), /cc_version=2\.1\.290\./);
+		assert.equal(wire[0].body.thinking.type, "adaptive");
+		assert.equal(wire[0].body.thinking.display, "summarized");
+		assert.equal(wire[0].body.messages.at(-1).output_config.effort, reasoning);
+		assert.match(wire[0].headers.get("anthropic-beta")!, /context-1m-2025-08-07/);
+		assert.match(wire[0].headers.get("anthropic-beta")!, /thinking-binding-controls-2026-08-01/);
 	}
 });
 
@@ -131,21 +155,21 @@ test("instrumentation sees the actual rewritten request and Pi-facing model iden
 	assert.equal(events.filter((e) => e.type === "done" || e.type === "error").length, 1);
 });
 
-test("tool calls and signed thinking survive replay without mutating history", async () => {
+for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: tool calls and signed thinking survive replay without mutating history`, async () => {
 	const wire: Wire[] = [];
 	const tools = [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } }];
 	const firstContext = normalizeContext({ tools, messages: [{ role: "user", content: "Read it", timestamp: 0 }] });
-	const first = await streamClaudeCodeProvider(model(), firstContext, { fetch: fixtureFetch(wire, (body) => response(body.model, "tool_use", true)), sessionId: "tool-loop" }, loadToken).result();
+	const first = await streamClaudeCodeProvider(model(id), firstContext, { fetch: fixtureFetch(wire, (body) => response(body.model, "tool_use", true)), sessionId: "tool-loop" }, loadToken).result();
 	assert.equal(first.stopReason, "toolUse");
 	const toolCall = first.content.find((c) => c.type === "toolCall")!;
 	assert.equal(toolCall.name, "read");
 	assert.deepEqual(toolCall.arguments, { path: "src/example.ts" });
 	const next = normalizeContext({ tools, messages: [...firstContext.messages.filter((m) => m.role !== "system"), first, { role: "toolResult", toolCallId: toolCall.id, toolName: "read", content: [{ type: "text", text: "file content" }], isError: false, timestamp: 1 }] });
-	const result = await streamClaudeCodeProvider(model(), next, { fetch: fixtureFetch(wire), sessionId: "tool-loop" }, loadToken).result();
+	const result = await streamClaudeCodeProvider(model(id), next, { fetch: fixtureFetch(wire), sessionId: "tool-loop" }, loadToken).result();
 	assert.equal(result.stopReason, "stop", result.errorMessage ?? "");
 	assert.match(JSON.stringify(wire[1].body.messages), /fixture-signature/);
 	assert.equal(first.api, "claude-code-anthropic");
-	assert.equal(first.model, "opus-5-5");
+	assert.equal(first.model, id);
 	const switched = await streamClaudeCodeProvider(model("sonnet-4-6"), next, { fetch: fixtureFetch(wire) }, loadToken).result();
 	assert.equal(switched.stopReason, "stop");
 	assert.doesNotMatch(JSON.stringify(wire.at(-1)!.body.messages), /fixture-signature/);
@@ -343,7 +367,7 @@ test("native summarizers reject truncated responses instead of saving partial su
 	assert.match(branch.error!, /incomplete/);
 });
 
-test("AgentSession.compact and navigateTree persist native summaries through the registered provider", async () => {
+for (const id of ["opus-5-5", "fable-5-2"]) test(`${id}: AgentSession.compact and navigateTree persist native summaries through the registered provider`, async () => {
 	const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "claude-provider-session-test-"));
 	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 	try {
@@ -357,13 +381,13 @@ test("AgentSession.compact and navigateTree persist native summaries through the
 		const loader = new DefaultResourceLoader({ cwd: directory, agentDir: directory, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
 		await loader.reload();
 		const manager = SessionManager.inMemory(directory);
-		manager.appendModelChange(CLAUDE_CODE_PROVIDER, "opus-5-5");
+		manager.appendModelChange(CLAUDE_CODE_PROVIDER, id);
 		const oldEntry = manager.appendMessage({ role: "user", content: "Old work on src/example.ts. ".repeat(100), timestamp: 0 });
-		const assistant = (text: string): AssistantMessage => ({ role: "assistant", api: "claude-code-anthropic", provider: CLAUDE_CODE_PROVIDER, model: "opus-5-5", content: [{ type: "text", text }], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1 });
+		const assistant = (text: string): AssistantMessage => ({ role: "assistant", api: "claude-code-anthropic", provider: CLAUDE_CODE_PROVIDER, model: id, content: [{ type: "text", text }], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1 });
 		manager.appendMessage(assistant("Implemented the change."));
 		manager.appendMessage({ role: "user", content: "Continue testing", timestamp: 2 });
 		manager.appendMessage(assistant("Tests are ready. ".repeat(20)));
-		({ session } = await createAgentSession({ cwd: directory, agentDir: directory, modelRuntime: runtime, model: runtime.getModel(CLAUDE_CODE_PROVIDER, "opus-5-5")!, sessionManager: manager, settingsManager: settings, resourceLoader: loader, noTools: "all" }));
+		({ session } = await createAgentSession({ cwd: directory, agentDir: directory, modelRuntime: runtime, model: runtime.getModel(CLAUDE_CODE_PROVIDER, id)!, sessionManager: manager, settingsManager: settings, resourceLoader: loader, noTools: "all" }));
 		const compacted = await session.compact("Preserve src/example.ts");
 		assert.match(compacted.summary, /Keep the provider working/);
 		assert.ok(manager.getEntries().some((entry) => entry.type === "compaction"));

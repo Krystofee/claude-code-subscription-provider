@@ -92,12 +92,14 @@ Co dělá:
   - `claude-code-subscription-provider/opus-4-7` → `claude-opus-4-7`
   - `claude-code-subscription-provider/opus-4-6` → `claude-opus-4-6`
   - `claude-code-subscription-provider/sonnet-4-6` → `claude-sonnet-4-6` (256k — subscription tier nemá 1M na Sonnetu)
+  - `claude-code-subscription-provider/fable-5-2` → `claude-fable-5-2` (1M context, 128k output)
   - `claude-code-subscription-provider/fable-5-1` → `claude-fable-5-1`
   - `claude-code-subscription-provider/fable-5` → `claude-fable-5`
 - 1M long-context beta (`context-1m-2025-08-07`) posílá jen u modelů s 1M oknem (Opus a Fable). U Sonnetu se vynechává — jinak Anthropic vrací 429 `Usage credits are required for long context requests` i na malém promptu.
 - pro requesty používá Anthropic Messages API a u všech modelů vynutí adaptive thinking (`compat.forceAdaptiveThinking`)
 - ceny, thinking levels (včetně `max`), replay pravidla a cache lifetimes kopíruje nativní pi-ai katalog; subscription context limity zůstávají explicitní
-- user agent se normalizuje minimálně na `claude-cli/2.1.280` — Opus 5.5 na starších verzích vrací 400 `claude_code_version_too_old`
+- pokud starší Pi ještě nemá Fable 5.2 v katalogu, použije capabilities Fable 5.1 a ceny 5.2 ($8 input / $40 output / $0.20 cache read / $10 cache write za milion tokenů)
+- user agent a billing header používají minimálně verzi `2.1.290` — Fable 5.2 na starších verzích vrací 400 `claude_code_version_too_old`
 - pro Opus 4.7+ a Fable 5+ automaticky nastaví `thinking.display = "summarized"` (defaultně skrývají thinking text, což by v UI vypadalo jako prázdná pauza před odpovědí); Opus 4.6 a Sonnet 4.6 thinking ukazují nativně
 - access token získá přes lokálně spuštěný `claude` (Claude Code) a MITM capture v izolovaném workeru; probe má vypnuté MCP, tools, skills i nastavení a zachycený model request se neposílá upstream
 - podporuje běžné `claude auth login --claudeai` i setup token předaný přes `CLAUDE_CODE_OAUTH_TOKEN`
@@ -129,6 +131,7 @@ Pak v pi (vyber libovolný model ze sady):
 /model claude-code-subscription-provider/opus-4-7
 /model claude-code-subscription-provider/opus-4-6
 /model claude-code-subscription-provider/sonnet-4-6   # 256k context
+/model claude-code-subscription-provider/fable-5-2
 /model claude-code-subscription-provider/fable-5-1
 /model claude-code-subscription-provider/fable-5
 ```
